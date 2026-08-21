@@ -1,0 +1,17 @@
+# 敏感/本地文件，不进仓库
+session.json
+.env
+*.local
+
+# 运行产物
+__pycache__/
+*.pyc
+*.log
+
+# 探索/调试截图
+*.png
+*.jpg
+
+# 系统
+.DS_Store
+Thumbs.db
