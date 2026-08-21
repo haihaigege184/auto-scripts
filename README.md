@@ -2,7 +2,7 @@
 
 青龙订阅源。集合各类每日自动化脚本，后续新脚本都放进本仓库，青龙通过订阅链接直接拉取。
 
-> 仓库地址（订阅用）：`https://github.com/<USER>/auto-scripts.git`
+> 仓库地址（订阅用）：`https://github.com/haihaigege184/auto-scripts.git`
 
 ---
 
@@ -30,7 +30,7 @@ auto-scripts/
 
 **方式 A：图形界面**
 青龙面板 → 定时任务 → 右上角「添加」→ 选择「拉取」：
-- 仓库链接：`https://github.com/<USER>/auto-scripts.git`
+- 仓库链接：`https://github.com/haihaigege184/auto-scripts.git`
 - 分支：`main`
 - 定时规则：`0 9 * * *`（每天 09:00）
 - 脚本路径（子目录）：`scripts/1ms`
@@ -39,7 +39,7 @@ auto-scripts/
 
 **方式 B：命令行（ql repo）**
 ```
-ql repo https://github.com/<USER>/auto-scripts.git "main" "scripts/1ms" "checkin" "login"
+ql repo https://github.com/haihaigege184/auto-scripts.git "main" "scripts/1ms" "checkin" "login"
 ```
 参数含义：`仓库地址 分支 子目录 任务正则(匹配checkin) 排除正则(排除login)`。
 
