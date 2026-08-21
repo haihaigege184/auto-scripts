@@ -27,7 +27,22 @@ import sys
 import json
 import time
 import urllib.request
-from playwright.sync_api import sync_playwright
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sys.stderr.write(
+        "\n[login] 错误: 未安装 playwright, 无法用无头浏览器登录 (1ms.run 登录含腾讯验证码,\n"
+        "        纯标准库无法绕过, 必须借助浏览器完成验证)。\n"
+        "请在青龙容器内一次性安装 (docker exec -it qinglong bash 后执行):\n"
+        "    pip3 install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple\n"
+        "    playwright install chromium\n"
+        "    playwright install-deps chromium   # 若启动报缺少系统库 (需 root)\n"
+        "安装后重新运行本任务即可自动登录。\n\n"
+        "临时兜底: 在青龙环境变量设 MS_TOKEN=<从浏览器开发者工具/本机 login.py --print-token 拿到的 token>,\n"
+        "          checkin.py 会优先读 token 文件, 读不到再回退 MS_TOKEN 环境变量。\n"
+    )
+    sys.exit(2)
 
 TARGET = "https://1ms.run/user/domain"
 AUTH_COOKIE_NAME = "auth_token"
