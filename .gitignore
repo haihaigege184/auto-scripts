@@ -3,6 +3,10 @@ session.json
 .env
 *.local
 
+# token 文件 (由 login.py 生成, 不进仓库)
+.token
+1ms_token.txt
+
 # 运行产物
 __pycache__/
 *.pyc

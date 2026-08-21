@@ -3,28 +3,18 @@
 """
 毫秒镜像 (1ms.run) 每日签到 —— 青龙版（无浏览器依赖）
 
-依赖: requests  (青龙内置)
-环境变量:
-  MS_TOKEN   —— 1ms.run 登录后的 auth_token cookie 值
-               接口鉴权: Authorization: Bearer <MS_TOKEN>
-  (可选) MS_UID —— 预留, 暂未使用
+读 token 顺序:
+  1. 文件 (默认 /ql/data/1ms_token.txt, 或同目录 .token, 可用 MS_TOKEN_FILE 覆盖)
+     —— 该文件由 login.py (青龙定时任务) 自动刷新
+  2. 环境变量 MS_TOKEN  (手动填的兜底)
+接口鉴权: Authorization: Bearer <auth_token>
 
-青龙定时建议: 0 9 * * *   (每天 09:00)
+青龙环境变量:
+  MS_PHONE / MS_PASSWORD  —— 给 login.py 用 (取/刷新 token)
+  (可选) MS_TOKEN_FILE    —— 指定 token 文件位置 (默认见上)
+  (可选) MS_TOKEN         —— 手动兜底 token
 
-鉴权说明:
-  1ms.run 的 /api/v1/mall/checkin* 接口要求
-      Authorization: Bearer <auth_token cookie 的值>
-  不是普通会话 cookie。token 取自 cookie 名 auth_token。
-
-获取 MS_TOKEN: 在本机运行 scripts/1ms/login.py (需 playwright+chromium)
-  set MS_PHONE=你的手机号
-  set MS_PASSWORD=你的密码
-  python scripts/1ms/login.py --print-token
-  输出 MS_TOKEN=xxxx  → 复制到青龙环境变量。
-
-token 过期 (脚本检测 401) 会推送提醒, 重新运行 login.py 取新值替换即可。
-
-推送: 优先用青龙自带 notify / sendNotify; 都没有则只打印。
+定时: 0 9 * * *  (每天 09:00, 需晚于 login.py 的刷新时间)
 """
 import os
 import requests
@@ -32,6 +22,31 @@ import requests
 BASE = "https://1ms.run"
 STATUS_API = "/api/v1/mall/checkin/status"
 CHECKIN_API = "/api/v1/mall/checkin"
+
+
+def token_file_path():
+    tf = os.environ.get("MS_TOKEN_FILE", "").strip()
+    if tf:
+        return tf
+    if os.path.isdir("/ql/data"):
+        return "/ql/data/1ms_token.txt"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token")
+
+
+def get_token():
+    tp = token_file_path()
+    if os.path.exists(tp):
+        try:
+            v = open(tp, "r", encoding="utf-8").read().strip()
+            if v:
+                return v, "file:" + tp
+        except Exception:
+            pass
+    v = os.environ.get("MS_TOKEN", "").strip()
+    if v:
+        return v, "env:MS_TOKEN"
+    return None, None
+
 
 try:
     from notify import send
@@ -44,9 +59,11 @@ except Exception:
 
 
 def main():
-    token = (os.environ.get("MS_TOKEN") or "").strip()
+    token, src = get_token()
     if not token:
-        send("毫秒镜像签到", "❌ 未配置 MS_TOKEN 环境变量, 请在青龙环境变量中添加。")
+        send("毫秒镜像签到",
+             "❌ 未找到 token: 请先确保 login.py 定时任务正常运行 (早于本任务), "
+             "或在青龙环境变量里设置 MS_TOKEN 兜底。")
         return
 
     headers = {
@@ -65,7 +82,9 @@ def main():
         return
 
     if sr.status_code in (401, 403):
-        send("毫秒镜像签到", "❌ 登录态失效 (401/403), 请重新获取 MS_TOKEN 并更新青龙环境变量。\n获取方法: 在本机运行 scripts/1ms/login.py --print-token, 复制输出的 MS_TOKEN 值。")
+        send("毫秒镜像签到",
+             "❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行 (需早于本任务), "
+             "或手动重跑 login.py 刷新 token。")
         return
 
     try:
@@ -89,7 +108,7 @@ def main():
         return
 
     if cr.status_code in (401, 403):
-        send("毫秒镜像签到", "❌ 登录态失效 (401/403), 请重新获取 MS_TOKEN 并更新青龙环境变量。")
+        send("毫秒镜像签到", "❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行。")
         return
 
     try:
