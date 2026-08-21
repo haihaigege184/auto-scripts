@@ -80,20 +80,29 @@ ql repo https://github.com/haihaigege184/auto-scripts.git "main" "scripts/1ms" "
 
 青龙「定时任务」列表里点对应任务 → 编辑 → 改「定时规则」即可。
 
-### 四、青龙容器内安装 playwright（一次性）
+### 四、青龙容器内安装 playwright（**必需，一次性**）
 
-`login.py` 需要无头浏览器登录。在青龙容器里执行一次：
+`login.py` 必须靠无头浏览器登录：**1ms.run 登录含腾讯验证码，纯标准库无法绕过**（已实测：不带验证码报「请完成验证码验证」，带假 ticket 报「验证失败」）。所以 `login.py` 一定要在青龙里装好 playwright + chromium，否则每次 token 过期（约 2 天）后签到就会失效。
+
 ```bash
-# 进容器 (宿主机执行)
+# 1) 进容器 (在宿主机执行; 若你用 NAS/面板自带终端, 直接开终端即可)
 docker exec -it qinglong bash
 
-# 容器内
-pip install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 2) 容器内安装 (务必装在"运行定时任务的那个 python"里)
+pip3 install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple
 playwright install chromium
-# 若缺系统库, 再装依赖 (Debian/Ubuntu 系)
-playwright install-deps chromium   # 需要 root, 一般青龙容器就是 root
+playwright install-deps chromium   # 补系统库(Debian/Ubuntu 系, 需 root; 青龙容器默认 root)
+
+# 3) 验证安装成功 (无报错即 OK)
+python3 -c "from playwright.sync_api import sync_playwright; print('playwright OK')"
 ```
-装好后 `login.py` 即可定时运行。若未安装，`login.py` 任务会报 ImportError，`checkin.py` 仍可手动用 `MS_TOKEN` 兜底运行。
+
+常见坑：
+- **装完仍 ImportError**：确认 `pip3` 与运行任务的 python 是同一个。青龙定时任务用的是容器内 python3，所以要在 `docker exec` 进容器后装，别在宿主机装。
+- **启动报缺少 .so 库 / chromium 起不来**：多半是系统库不全，重跑 `playwright install-deps chromium`；Alpine 系镜像需改 apk 手动装对应库。
+- **磁盘/网络**：`playwright install chromium` 会下载约 150MB，确保容器有网络与空间。
+
+装好后 `login.py` 即可定时运行，token 自动续期。若暂时没装，`login.py` 只会在运行时报 ImportError（脚本已内置友好提示），`checkin.py` 仍可用 `MS_TOKEN` 环境变量兜底运行（见第五节）。
 
 ### 五、手动兜底（可选）
 
