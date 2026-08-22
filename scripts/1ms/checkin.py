@@ -99,13 +99,14 @@ def api_call(method, path, token, data=None):
         return -1, str(e)
 
 
-def push(title, content):
-    """如有推送渠道则额外推送; 没有就只 log, 不静默。"""
+def push(title, content, level="ok"):
+    """推送顺序: 青龙原生 notify/sendNotify  ->  自建 webhook (SEA2 机器人转发群)  ->  兜底只 log。"""
+    pushed = False
     try:
         from notify import send as _send
         try:
             _send(title, content)
-            return
+            pushed = True
         except Exception as e:
             log(f"[推送] notify.send 失败 (已忽略): {e}")
     except Exception:
@@ -114,13 +115,33 @@ def push(title, content):
         from sendNotify import send as _send2
         try:
             _send2(title, content)
-            return
+            pushed = True
         except Exception as e:
             log(f"[推送] sendNotify.send 失败 (已忽略): {e}")
     except Exception:
         pass
-    # 无推送渠道 —— 已在 log 中打印, 这里不再重复
-    log("[推送] 未配置推送渠道 (notify/sendNotify 均不可用), 仅本地日志。")
+    # 自建 webhook: 把消息推到 SEA2 机器人 -> 通知群 (纯 urllib, 无依赖)
+    wh = os.environ.get("MS_WEBHOOK_URL", "").strip()
+    if wh:
+        try:
+            import urllib.parse
+            data = json.dumps({
+                "title": title,
+                "content": content,
+                "level": level,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                wh,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                log(f"[推送] webhook 已发送 (HTTP {r.status})")
+                pushed = True
+        except Exception as e:
+            log(f"[推送] webhook 发送失败 (已忽略): {e}")
+    if not pushed:
+        log("[推送] 未配置任何推送渠道 (notify/sendNotify/webhook 均不可用), 仅本地日志。")
 
 
 def main():
@@ -130,7 +151,7 @@ def main():
         log("❌ 未找到 token: 来源=无")
         log("   请确认宿主机 cron 的 login.py 已正常执行 (早于本任务), ")
         log("   或在青龙环境变量设置 MS_TOKEN 兜底。")
-        push("毫秒镜像签到", "❌ 未找到 token")
+        push("毫秒镜像签到", "❌ 未找到 token", level="error")
         return
     log(f"token 来源: {src} (长度 {len(token)})")
 
@@ -140,10 +161,10 @@ def main():
         log(f"   响应文本: {resp[:300]}")
         if st in (401, 403):
             log("❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行。")
-            push("毫秒镜像签到", "❌ 登录态失效 (401/403)")
+            push("毫秒镜像签到", "❌ 登录态失效 (401/403)", level="error")
         else:
             log(f"⚠️ 状态接口返回异常 (HTTP {st})")
-            push("毫秒镜像签到", f"⚠️ 状态接口异常 (HTTP {st})")
+            push("毫秒镜像签到", f"⚠️ 状态接口异常 (HTTP {st})", level="warn")
         return
 
     sdata = resp.get("data", {})
@@ -154,7 +175,7 @@ def main():
         msg = (f"✅ {today} 今日已签到\n"
                f"连续 {sdata.get('continuous_days')} 天 / 累计 {sdata.get('total_days')} 天")
         log(msg.replace("\n", " | "))
-        push("毫秒镜像签到", msg)
+        push("毫秒镜像签到", msg, level="ok")
         return
 
     log("尚未签到, 发起 POST 签到...")
@@ -164,10 +185,10 @@ def main():
         log(f"   响应文本: {cresp[:300]}")
         if cst in (401, 403):
             log("❌ 登录态失效 (401/403)。")
-            push("毫秒镜像签到", "❌ 登录态失效 (401/403)")
+            push("毫秒镜像签到", "❌ 登录态失效 (401/403)", level="error")
         else:
             log(f"⚠️ 签到返回异常 (HTTP {cst})")
-            push("毫秒镜像签到", f"⚠️ 签到异常 (HTTP {cst})")
+            push("毫秒镜像签到", f"⚠️ 签到异常 (HTTP {cst})", level="warn")
         return
 
     if cst == 200 and cresp.get("code") == 0:
@@ -175,10 +196,10 @@ def main():
         msg = (f"🎉 {today} 签到成功\n"
                f"连续 {rd.get('continuous_days')} 天 / 累计 {rd.get('total_days')} 天")
         log(msg.replace("\n", " | "))
-        push("毫秒镜像签到", msg)
+        push("毫秒镜像签到", msg, level="ok")
     else:
         log(f"⚠️ 签到返回非预期: code={cresp.get('code')} msg={cresp.get('message')} raw={cresp}")
-        push("毫秒镜像签到", f"⚠️ 签到异常: {cresp}")
+        push("毫秒镜像签到", f"⚠️ 签到异常: {cresp}", level="warn")
     log("=== 毫秒镜像签到 结束 ===")
 
 
