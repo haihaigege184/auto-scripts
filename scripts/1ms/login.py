@@ -70,8 +70,27 @@ def token_file_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token")
 
 
+def _log_file_path():
+    lp = os.environ.get("MS_LOG_FILE", "").strip()
+    if lp:
+        return lp
+    # 默认与 token 文件同目录
+    d = os.path.dirname(token_file_path())
+    if d and os.path.isdir(d):
+        return os.path.join(d, "login.log")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "login.log")
+
+
 def log(*a):
-    print("[login]", *a, flush=True)
+    msg = "[login] " + " ".join(str(x) for x in a)
+    ts = "[" + time.strftime("%Y-%m-%d %H:%M:%S") + "] "
+    line = ts + msg
+    print(line, flush=True)
+    try:
+        with open(_log_file_path(), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def get_args():
