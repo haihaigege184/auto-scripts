@@ -159,3 +159,42 @@ python scripts/1ms/checkin.py
 MS_TOKEN_FILE=/tmp/t.txt MS_PHONE=... MS_PASSWORD=... python scripts/1ms/login.py
 MS_TOKEN_FILE=/tmp/t.txt python scripts/1ms/checkin.py
 ```
+
+---
+
+## 青龙消息推送到 QQ 群（SEA2 机器人 ql-notify 插件）
+
+签到/登录结果除了青龙原生 `notify`，还会通过自建 webhook 转发到 SEA2 机器人，再推送到 QQ 群。
+
+### 推送范围规则（2026-08-22 改版）
+
+- **默认只推送给「管理员群」**，不推所有群。
+  管理员群由 SEA2 环境变量 `QL_NOTIFY_ADMIN_GROUPS`（逗号分隔群号）指定；未设则退化为 `config.notify_groups` 第一个群。
+- **普通群需主动开启**：在目标 QQ 群内发送命令 `开启青龙推送`，该群被加入白名单并开始接收推送；
+  发送 `关闭青龙推送` 则从白名单移除、停止接收。
+- 白名单持久化在 SEA2 的 `config.json` 的 `ql_notify_whitelist` 字段（重启后保留）。
+- 群命令**仅管理员/开发者**（SEA2 `superAdmin`/`developer`）可执行，普通成员发命令会被拒绝。
+
+### 配置清单
+
+1. **青龙侧**（必需）：环境变量 `MS_WEBHOOK_URL=http://172.17.0.1:13002/webhook/ql`
+   （青龙容器经 docker0 网关 `172.17.0.1` 访问宿主机上的 SEA2 webhook；若 SEA2 与青龙同机但不同容器请保持此地址）。
+   已写入青龙 `/ql/data/config/env.sh`，青龙定时任务运行时自动 source。
+2. **SEA2 侧**：插件 `ql-notify` 监听 `0.0.0.0:13002`，`QL_NOTIFY_ADMIN_GROUPS` 已注入 `ecosystem.sea2-bot.config.js`。
+
+### 运维命令
+
+```bash
+# 查看当前推送目标（管理员群 + 白名单群）
+curl http://127.0.0.1:13002/health
+
+# 手动测试推送（在青龙容器内）
+. /ql/data/config/env.sh
+python3 -c "import os,json,urllib.request; \
+u=os.environ['MS_WEBHOOK_URL']; \
+urllib.request.urlopen(urllib.request.Request(u, \
+json.dumps({'title':'测试','content':'hello','level':'ok'}).encode(), \
+headers={'Content-Type':'application/json'}))"
+```
+
+> 插件源码：`ql-notify/index.js`（随本仓库 `ql-notify/` 目录分发，部署到 SEA2 的 `plugins/ql-notify/`）。
