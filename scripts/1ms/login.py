@@ -98,9 +98,13 @@ def resolve_binary(env_name, *cands):
     return None
 
 
-def find_and_click_text(driver, text, timeout=6, contains=False):
-    xp = (f"//*[contains(normalize-space(), '{text}')]"
-          if contains else f"//*[normalize-space()='{text}']")
+def find_and_click_text(driver, text, timeout=6, contains=False, exact=False):
+    if exact:
+        xp = f"//*[normalize-space()='{text}']"
+    elif contains:
+        xp = f"//*[contains(normalize-space(), '{text}')]"
+    else:
+        xp = f"//*[normalize-space()='{text}']"
     try:
         el = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((By.XPATH, xp)))
