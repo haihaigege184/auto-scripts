@@ -36,6 +36,7 @@ import sys
 import json
 import time
 import urllib.request
+import urllib.parse
 
 try:
     from selenium import webdriver
@@ -91,6 +92,43 @@ def log(*a):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def notify(title, content, level="ok"):
+    """推送: 青龙 notify/sendNotify -> 自建 webhook (SEA2 机器人转发群) -> 兜底只 log。"""
+    pushed = False
+    try:
+        from notify import send as _send
+        try:
+            _send(title, content)
+            pushed = True
+        except Exception as e:
+            log("notify.send 失败 (已忽略):", e)
+    except Exception:
+        pass
+    try:
+        from sendNotify import send as _send2
+        try:
+            _send2(title, content)
+            pushed = True
+        except Exception as e:
+            log("sendNotify.send 失败 (已忽略):", e)
+    except Exception:
+        pass
+    wh = os.environ.get("MS_WEBHOOK_URL", "").strip()
+    if wh:
+        try:
+            data = json.dumps({"title": title, "content": content, "level": level}).encode("utf-8")
+            req = urllib.request.Request(
+                wh, data=data,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                log(f"webhook 已发送 (HTTP {r.status})")
+                pushed = True
+        except Exception as e:
+            log(f"webhook 发送失败 (已忽略): {e}")
+    if not pushed:
+        log("[推送] 未配置任何推送渠道, 仅本地日志。")
 
 
 def get_args():
@@ -217,6 +255,7 @@ def main():
         log("reached_1ms:", reached, "final_url:", driver.current_url)
 
         if not reached:
+            notify("毫秒镜像登录", "❌ 未能跳回 1ms.run (验证码/授权未通过?)", level="error")
             driver.save_screenshot(
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_FAIL.png"))
             log("did not return to 1ms.run; screenshot saved")
@@ -227,6 +266,7 @@ def main():
         at = next((c["value"] for c in cookies if c["name"] == AUTH_COOKIE_NAME), None)
         if not at:
             log("WARN: auth_token cookie not found")
+            notify("毫秒镜像登录", "❌ 未拿到 auth_token cookie", level="error")
             sys.exit(1)
 
         # 校验登录态 (标准库 urllib, 免额外依赖)
@@ -243,6 +283,7 @@ def main():
 
         if not ok:
             log("VERIFY FAILED")
+            notify("毫秒镜像登录", "❌ token 校验失败 (VERIFY FAILED)", level="error")
             sys.exit(1)
 
         tp = token_file_path()
@@ -254,6 +295,7 @@ def main():
             print("MS_TOKEN=" + at, flush=True)
             log("printed MS_TOKEN")
         log("VERIFY OK")
+        notify("毫秒镜像登录", "✅ token 已刷新并校验通过", level="ok")
         sys.exit(0)
     finally:
         try:
