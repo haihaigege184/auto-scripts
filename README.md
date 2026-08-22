@@ -15,7 +15,7 @@ auto-scripts/
 └── scripts/
     └── 1ms/
         ├── checkin.py   # 毫秒镜像(1ms.run)每日签到 —— 青龙定时任务 (无浏览器依赖)
-        └── login.py     # 取/刷新 token —— 青龙定时任务 (需 playwright+chromium)
+        └── login.py     # 取/刷新 token —— 青龙定时任务 (需 selenium + 系统 chromium)
 ```
 
 约定：每个站点一个子目录（`scripts/<站点>/`），脚本读取环境变量、纯 `requests`、用青龙 `notify` 推送。
@@ -80,27 +80,33 @@ ql repo https://github.com/haihaigege184/auto-scripts.git "main" "scripts/1ms" "
 
 青龙「定时任务」列表里点对应任务 → 编辑 → 改「定时规则」即可。
 
-### 四、青龙容器内安装 playwright（**必需，一次性**）
+### 四、青龙容器内安装 selenium + 系统 chromium（**必需，一次性**）
 
-`login.py` 必须靠无头浏览器登录：**1ms.run 登录含腾讯验证码，纯标准库无法绕过**（已实测：不带验证码报「请完成验证码验证」，带假 ticket 报「验证失败」）。所以 `login.py` 一定要在青龙里装好 playwright + chromium，否则每次 token 过期（约 2 天）后签到就会失效。
+`login.py` 必须靠无头浏览器登录：**1ms.run 登录含腾讯验证码，纯标准库无法绕过**（已实测：不带验证码报「请完成验证码验证」，带假 ticket 报「验证失败」）。所以 `login.py` 一定要在青龙里装好 selenium + 系统 chromium，否则每次 token 过期（约 2 天）后签到就会失效。
+
+> 为什么用 selenium 而不是 playwright：qinglong 镜像（whyour/qinglong）是 **Alpine/musl**，而 playwright 只发 manylinux 轮子，在 Alpine 上 `pip install playwright` 会报 `from versions: none`，装不上。selenium 是纯 Python 包，Alpine/Debian 都能装，再配合系统原生 chromium 即可。
 
 ```bash
 # 1) 进容器 (在宿主机执行; 若你用 NAS/面板自带终端, 直接开终端即可)
 docker exec -it qinglong bash
 
 # 2) 容器内安装 (务必装在"运行定时任务的那个 python"里)
-pip3 install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple
-playwright install chromium
-playwright install-deps chromium   # 补系统库(Debian/Ubuntu 系, 需 root; 青龙容器默认 root)
+#    Alpine 系 (whyour/qinglong 等):
+pip3 install selenium -i https://pypi.org/simple
+apk add --no-cache chromium chromium-chromedriver
+#    Debian/Ubuntu 系:
+# pip3 install selenium
+# apt-get install -y chromium chromium-driver
 
 # 3) 验证安装成功 (无报错即 OK)
-python3 -c "from playwright.sync_api import sync_playwright; print('playwright OK')"
+python3 -c "from selenium import webdriver; print('selenium OK')"
+which chromium chromedriver
 ```
 
 常见坑：
 - **装完仍 ImportError**：确认 `pip3` 与运行任务的 python 是同一个。青龙定时任务用的是容器内 python3，所以要在 `docker exec` 进容器后装，别在宿主机装。
-- **启动报缺少 .so 库 / chromium 起不来**：多半是系统库不全，重跑 `playwright install-deps chromium`；Alpine 系镜像需改 apk 手动装对应库。
-- **磁盘/网络**：`playwright install chromium` 会下载约 150MB，确保容器有网络与空间。
+- **找不到 chromium / chromedriver**：脚本会自动探测 `/usr/bin/chromium`、`/usr/bin/chromedriver` 等路径；若装在别处，用环境变量 `MS_CHROMIUM_BIN` / `MS_CHROMEDRIVER_BIN` 指定。
+- **磁盘/网络**：`apk add chromium` 会下载约 100MB+，确保容器有网络与空间。
 
 装好后 `login.py` 即可定时运行，token 自动续期。若暂时没装，`login.py` 只会在运行时报 ImportError（脚本已内置友好提示），`checkin.py` 仍可用 `MS_TOKEN` 环境变量兜底运行（见第五节）。
 
@@ -108,7 +114,7 @@ python3 -c "from playwright.sync_api import sync_playwright; print('playwright O
 
 若你不想在青龙跑 `login.py`，仍可手动取 token 填进 `MS_TOKEN` 环境变量：
 ```bash
-# 在本机 (需 playwright+chromium)
+# 在本机 (需 selenium + chromium)
 MS_PHONE=你的手机号 MS_PASSWORD=你的密码 python scripts/1ms/login.py --print-token
 # 输出 MS_TOKEN=eyJhbGciOi...  → 复制等号后整段填进青龙环境变量 MS_TOKEN
 ```
@@ -134,7 +140,7 @@ MS_PHONE=你的手机号 MS_PASSWORD=你的密码 python scripts/1ms/login.py --
            def send(t, c): print(f"[{t}]\n{c}")
    ```
 3. 定时任务脚本（如 `checkin.py`）纯 `requests`，无浏览器依赖。
-4. 需要登录取 token 的，单独放 `login.py`/`fetch_xxx.py`，用 playwright，并**把 token 写文件**供签到脚本读取。
+4. 需要登录取 token 的，单独放 `login.py`/`fetch_xxx.py`，用 selenium + 系统 chromium，并**把 token 写文件**供签到脚本读取。
 5. 放到 `scripts/<站点>/` 下，青龙订阅时按子目录拉取。
 
 ---
