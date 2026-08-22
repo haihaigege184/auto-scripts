@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-毫秒镜像 (1ms.run) 取 token 脚本 —— 可在青龙里定时运行
+毫秒镜像 (1ms.run) 取 token 脚本 —— 用无头浏览器登录, 取出 auth_token 写文件
 
 依赖:
-  - selenium (纯 python 包, pip install selenium 即可, Alpine/Debian 均可)
+  - selenium (pip install selenium)
   - 系统 chromium 浏览器 + chromedriver
-        Alpine 系 (如 whyour/qinglong):  apk add --no-cache chromium chromium-chromedriver
-        Debian/Ubuntu 系:               apt-get install -y chromium chromium-driver
-  (注: 早期版本用 playwright, 但 qinglong 镜像多为 Alpine/musl, playwright 的 manylinux
-   轮子无法安装, 故改用 selenium + 系统原生 chromium, 兼容性更好)
+        Debian/Ubuntu 系:  apt-get install -y chromium chromium-driver
+        (qinglong 容器多为 Alpine, 无法装 playwright; 推荐在本脚本跑在宿主机 cron)
+  - 1ms.run 登录走 Logto OIDC + 腾讯防水墙验证码, 纯标准库无法绕过, 必须浏览器。
 
 设计:
-  - 从环境变量 MS_PHONE / MS_PASSWORD 读取账号密码 (青龙环境变量配置, 无需手动填)
-  - 登录后取出 auth_token, 写入 token 文件 (供 checkin.py 读取, 实现自动刷新)
-  - token 文件默认路径:
-        若 /ql/data 目录存在 -> /ql/data/1ms_token.txt   (青龙持久化目录, 仓库重新拉取不会清掉)
+  - 账号密码从环境变量 MS_PHONE / MS_PASSWORD 读取 (青龙/宿主机环境变量配置)
+  - 登录成功后取 auth_token cookie, 写入 token 文件 (供 checkin.py 读取, 实现自动刷新)
+  - token 文件默认:
+        若 /ql/data 目录存在 -> /ql/data/1ms_token.txt   (青龙持久化目录)
         否则 -> 与本脚本同目录的 .token                  (本机/调试用)
     可用环境变量 MS_TOKEN_FILE 覆盖路径。
-  - 兼容 --print-token: 把 MS_TOKEN=xxx 打到 stdout (便于本地/手动取用)
+  - 兼容 --print-token: 把 MS_TOKEN=xxx 打到 stdout
 
-青龙部署:
-  - 环境变量: MS_PHONE, MS_PASSWORD  (必填)
-  - 定时任务: 例如 55 8 * * *  (每天 08:55, 需早于签到 checkin.py)
-  - 命令: task /ql/data/scripts/auto-scripts/scripts/1ms/login.py
+青龙部署 (推荐宿主机 cron 方案, 因容器 Alpine 无法跑浏览器):
+  - 宿主机 (Debian) 装好 chromium + chromedriver + selenium
+  - 环境变量: MS_PHONE, MS_PASSWORD, MS_TOKEN_FILE=/root/ql1/1ms_token.txt
+    (该路径 bind 挂进容器即 /ql/data/1ms_token.txt, checkin.py 原样读取)
+  - 宿主机 cron: 55 8 * * *  (需早于签到 checkin.py 的 0 9 * * *)
+  - 命令: MS_PHONE=... MS_PASSWORD=... MS_TOKEN_FILE=/root/ql1/1ms_token.txt python3 /root/ql1/scripts/haihaigege184_auto-scripts_main/scripts/1ms/login.py
 
-流程 (Logto OIDC, 密码登录无图形验证码):
-  填手机号 -> 继续 -> 改用密码登录 -> 填密码 -> 登录
-  -> OIDC 授权确认页点"授权" -> 跳回 1ms.run -> 导出 auth_token cookie
+流程:
+  1ms.run/login -> 点"统一认证登录" -> OIDC 页填手机号 -> 继续
+  -> 改用密码登录 -> 填密码 -> 登录 -> (腾讯验证码 headless 自动过)
+  -> 授权确认页点"授权" -> 跳回 1ms.run -> 导出 auth_token cookie
 """
 import os
 import sys
@@ -46,24 +48,17 @@ except ImportError:
     sys.stderr.write(
         "\n[login] 错误: 未安装 selenium, 无法用无头浏览器登录 (1ms.run 登录含腾讯验证码,\n"
         "        纯标准库无法绕过, 必须借助浏览器完成验证)。\n"
-        "请在青龙容器内一次性安装 (docker exec -it qinglong bash 后执行):\n"
-        "  Alpine 系 (whyour/qinglong 等):\n"
-        "    pip3 install selenium -i https://pypi.org/simple\n"
-        "    apk add --no-cache chromium chromium-chromedriver\n"
-        "  Debian/Ubuntu 系:\n"
-        "    pip3 install selenium\n"
-        "    apt-get install -y chromium chromium-driver\n"
+        "安装:  pip3 install selenium  (Debian 还需 apt-get install -y chromium chromium-driver)\n"
         "安装后重新运行本任务即可自动登录。\n\n"
-        "临时兜底: 在青龙环境变量设 MS_TOKEN=<从浏览器开发者工具/本机 login.py --print-token 拿到的 token>,\n"
+        "临时兜底: 在环境变量设 MS_TOKEN=<从浏览器开发者工具拿到的 token>,\n"
         "          checkin.py 会优先读 token 文件, 读不到再回退 MS_TOKEN 环境变量。\n"
     )
     sys.exit(2)
 
 
-TARGET = "https://1ms.run/user/domain"
+TARGET = "https://1ms.run/login?redirect=/user/domain"
 AUTH_COOKIE_NAME = "auth_token"
-BASE = "https://1ms.run"
-STATUS_API = BASE + "/api/v1/mall/checkin/status"
+STATUS_API = "https://1ms.run/api/v1/mall/checkin/status"
 
 
 def token_file_path():
@@ -82,13 +77,12 @@ def log(*a):
 def get_args():
     phone = os.environ.get("MS_PHONE", "").strip()
     password = os.environ.get("MS_PASSWORD", "").strip()
-    args = sys.argv
     i = 1
-    while i < len(args):
-        if args[i] in ("--phone", "-u"):
-            phone = args[i + 1]; i += 2
-        elif args[i] in ("--password", "-p"):
-            password = args[i + 1]; i += 2
+    while i < len(sys.argv):
+        if sys.argv[i] in ("--phone", "-u"):
+            phone = sys.argv[i + 1]; i += 2
+        elif sys.argv[i] in ("--password", "-p"):
+            password = sys.argv[i + 1]; i += 2
         else:
             i += 1
     return phone, password
@@ -104,41 +98,26 @@ def resolve_binary(env_name, *cands):
     return None
 
 
-def click_text(driver, text, timeout=6, exact=True):
-    xp = (f"//*[normalize-space()='{text}']" if exact
-          else f"//*[contains(normalize-space(), '{text}')]")
+def find_and_click_text(driver, text, timeout=6, contains=False):
+    xp = (f"//*[contains(normalize-space(), '{text}')]"
+          if contains else f"//*[normalize-space()='{text}']")
     try:
         el = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, xp))
-        )
+            EC.element_to_be_clickable((By.XPATH, xp)))
         el.click()
         return True
     except Exception:
         return False
 
 
-def click_button_contains(driver, text, timeout=6):
-    xp = f"//button[contains(normalize-space(), '{text}')]"
+def find_and_click_button(driver, text, timeout=6):
+    xp = f"//button[normalize-space()='{text}']"
     try:
         el = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, xp))
-        )
+            EC.element_to_be_clickable((By.XPATH, xp)))
         el.click()
         return True
     except Exception:
-        return False
-
-
-def fill_placeholder(driver, ph, value, timeout=8):
-    try:
-        el = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.XPATH, f"//input[@placeholder='{ph}']"))
-        )
-        el.clear()
-        el.send_keys(value)
-        return True
-    except Exception as e:
-        log("fill fail:", ph, e)
         return False
 
 
@@ -148,21 +127,13 @@ def main():
         log("ERROR: 需要 MS_PHONE / MS_PASSWORD 环境变量 (或 --phone/--password 参数)。")
         sys.exit(1)
 
-    chrome_bin = resolve_binary(
-        "MS_CHROMIUM_BIN",
-        "/usr/bin/chromium", "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-    )
-    driver_bin = resolve_binary(
-        "MS_CHROMEDRIVER_BIN",
-        "/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
-        "/usr/bin/chromedriver.exe",
-    )
-    if not chrome_bin:
-        log("ERROR: 找不到 chromium, 请安装并在 MS_CHROMIUM_BIN 指定, 或放到 /usr/bin/chromium")
-        sys.exit(2)
-    if not driver_bin:
-        log("ERROR: 找不到 chromedriver, 请安装 chromium-chromedriver 并在 MS_CHROMEDRIVER_BIN 指定")
+    chrome_bin = resolve_binary("MS_CHROMIUM_BIN",
+                                "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                                "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable")
+    driver_bin = resolve_binary("MS_CHROMEDRIVER_BIN",
+                                 "/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver")
+    if not chrome_bin or not driver_bin:
+        log("ERROR: 找不到 chromium/chromedriver, 请安装并设 MS_CHROMIUM_BIN/MS_CHROMEDRIVER_BIN")
         sys.exit(2)
     log("using chromium:", chrome_bin, "| chromedriver:", driver_bin)
 
@@ -174,50 +145,57 @@ def main():
     driver = webdriver.Chrome(service=svc, options=opts)
     try:
         driver.get(TARGET)
-        time.sleep(2.5)
-
-        if click_text(driver, "统一认证登录", timeout=8):
-            log("clicked 统一认证登录")
-        time.sleep(2.5)
-
-        if not fill_placeholder(driver, "请输入手机号", phone):
-            log("WARN: 手机号输入框未找到, 可能已跳转到登录页")
-        time.sleep(0.4)
-        if click_text(driver, "继续", exact=True, timeout=6):
-            log("clicked 继续")
         time.sleep(3)
 
-        if click_text(driver, "改用密码登录", timeout=8):
+        # 1) 点"统一认证登录"
+        WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, ".auth-entry__btn"))).click()
+        log("clicked 统一认证登录")
+        time.sleep(5)
+
+        # 2) 填手机号 -> 继续
+        ph = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.ID, "v-0-phone")))
+        ph.clear(); ph.send_keys(phone)
+        log("filled phone")
+        time.sleep(0.5)
+        if not find_and_click_button(driver, "继续", timeout=8):
+            find_and_click_text(driver, "继续", timeout=4)
+        log("clicked 继续")
+        time.sleep(4)
+
+        # 3) 改用密码登录 -> 填密码 -> 登录
+        if find_and_click_text(driver, "改用密码登录", timeout=8):
             log("clicked 改用密码登录")
-        time.sleep(1.5)
+            time.sleep(2)
+        pw = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.ID, "v-0-password")))
+        pw.clear(); pw.send_keys(password)
+        log("filled password")
+        time.sleep(0.5)
+        if not find_and_click_button(driver, "登录", timeout=8):
+            find_and_click_text(driver, "登录", timeout=4)
+        log("clicked 登录, waiting for redirect...")
 
-        if not fill_placeholder(driver, "请输入密码", password):
-            log("WARN: 密码输入框未找到")
-        time.sleep(0.4)
-        if click_button_contains(driver, "登录", timeout=6):
-            log("clicked 登录, waiting for redirect...")
-        else:
-            click_text(driver, "登录", exact=True, timeout=4)
-
+        # 4) 等待跳转回 1ms.run, 期间点授权确认
         t0 = time.time()
         reached = False
-        while time.time() - t0 < 30:
+        while time.time() - t0 < 60:
             url = driver.current_url
-            if "1ms.run" in url and "login.wang" not in url:
+            if "1ms.run" in url and "login.wang" not in url and "/login" not in url:
                 reached = True
                 break
             for label in ["授权", "允许", "Authorize", "Allow", "同意并继续"]:
-                if click_text(driver, label, exact=True, timeout=2):
+                if find_and_click_text(driver, label, exact=True, timeout=2):
                     log("clicked consent:", label)
                     time.sleep(2)
                     break
-            time.sleep(1.5)
+            time.sleep(2)
         log("reached_1ms:", reached, "final_url:", driver.current_url)
 
         if not reached:
             driver.save_screenshot(
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_FAIL.png")
-            )
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_FAIL.png"))
             log("did not return to 1ms.run; screenshot saved")
             sys.exit(1)
 
@@ -233,8 +211,7 @@ def main():
         try:
             req = urllib.request.Request(
                 STATUS_API,
-                headers={"Authorization": "Bearer " + at, "Accept": "application/json"},
-            )
+                headers={"Authorization": "Bearer " + at, "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 j = json.loads(r.read().decode())
                 ok = r.status == 200 and "data" in j
@@ -245,7 +222,6 @@ def main():
             log("VERIFY FAILED")
             sys.exit(1)
 
-        # 写 token 文件 (供 checkin.py 自动读取)
         tp = token_file_path()
         with open(tp, "w", encoding="utf-8") as f:
             f.write(at)
