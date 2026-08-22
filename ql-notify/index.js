@@ -36,7 +36,8 @@ class QlNotifyPlugin extends BasePlugin {
         this.napcatToken = config.napcat_token || '';
         this.notifyGroups = (config.notify_groups || []).map((x) => String(x));
 
-        this.host = process.env.QL_NOTIFY_HOST || '127.0.0.1';
+        // 监听所有接口, 以便青龙容器 (网关 172.17.0.1) 能访问本机 webhook
+        this.host = process.env.QL_NOTIFY_HOST || '0.0.0.0';
         this.port = parseInt(process.env.QL_NOTIFY_PORT || '13002', 10);
 
         this._server = null;
