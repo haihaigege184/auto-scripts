@@ -28,6 +28,36 @@ import urllib.request
 import urllib.error
 
 BASE = "https://1ms.run"
+
+
+def load_env_file():
+    """青龙 task 命令不注入 Envs 表也不 source env.sh, 这里手动解析 /ql/data/config/env.sh。
+    仅当对应变量尚未在环境中存在时才注入 (不覆盖已有值)。"""
+    candidates = [
+        "/ql/data/config/env.sh",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "env.sh"),
+    ]
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if not line.startswith("export "):
+                        continue
+                    body = line[len("export "):].strip()
+                    if "=" not in body:
+                        continue
+                    k, v = body.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except Exception:
+            pass
 STATUS_API = "/api/v1/mall/checkin/status"
 CHECKIN_API = "/api/v1/mall/checkin"
 
@@ -145,6 +175,7 @@ def push(title, content, level="ok"):
 
 
 def main():
+    load_env_file()
     log("=== 毫秒镜像签到 开始 ===")
     token, src = get_token()
     if not token:
