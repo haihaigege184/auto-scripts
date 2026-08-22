@@ -5,25 +5,51 @@
 
 读 token 顺序:
   1. 文件 (默认 /ql/data/1ms_token.txt, 或同目录 .token, 可用 MS_TOKEN_FILE 覆盖)
-     —— 该文件由 login.py (青龙定时任务) 自动刷新
+     —— 该文件由 login.py (宿主机 cron 定时任务) 自动刷新
   2. 环境变量 MS_TOKEN  (手动填的兜底)
 接口鉴权: Authorization: Bearer <auth_token>
 
 青龙环境变量:
-  MS_PHONE / MS_PASSWORD  —— 给 login.py 用 (取/刷新 token)
+  MS_PHONE / MS_PASSWORD  —— 给 login.py 用 (取/刷新 token, 跑在宿主机 cron)
   (可选) MS_TOKEN_FILE    —— 指定 token 文件位置 (默认见上)
   (可选) MS_TOKEN         —— 手动兜底 token
 
-定时: 0 9 * * *  (每天 09:00, 需晚于 login.py 的刷新时间)
+定时 (青龙容器内): 20 7 * * *  (每天 07:20, 需晚于宿主机 login 的 08:55 前一天刷新)
+
+日志策略: 无论是否配置推送渠道, 全程用 print 输出到 stdout (青龙日志可见),
+          并额外写一份本地日志文件 (MS_LOG_FILE 或默认 /ql/data/1ms_checkin.log),
+          绝不静默, 手动运行也能看到完整过程。
 """
 import os
+import sys
 import json
+import datetime
 import urllib.request
 import urllib.error
 
 BASE = "https://1ms.run"
 STATUS_API = "/api/v1/mall/checkin/status"
 CHECKIN_API = "/api/v1/mall/checkin"
+
+
+def log_path():
+    lp = os.environ.get("MS_LOG_FILE", "").strip()
+    if lp:
+        return lp
+    if os.path.isdir("/ql/data"):
+        return "/ql/data/1ms_checkin.log"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin.log")
+
+
+def log(msg):
+    """打屏 (青龙日志可见) + 写本地日志文件。"""
+    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(log_path(), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def token_file_path():
@@ -42,26 +68,16 @@ def get_token():
             v = open(tp, "r", encoding="utf-8").read().strip()
             if v:
                 return v, "file:" + tp
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"读取 token 文件失败 {tp}: {e}")
     v = os.environ.get("MS_TOKEN", "").strip()
     if v:
         return v, "env:MS_TOKEN"
     return None, None
 
 
-try:
-    from notify import send
-except Exception:
-    try:
-        from sendNotify import send
-    except Exception:
-        def send(title, content):
-            print(f"[{title}]\n{content}")
-
-
 def api_call(method, path, token, data=None):
-    """返回 (status_code, obj_or_text)。成功返回解析后的 dict；HTTPError 返回 (code, 文本)。"""
+    """返回 (status_code, obj_or_text)。"""
     url = BASE + path
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -83,46 +99,89 @@ def api_call(method, path, token, data=None):
         return -1, str(e)
 
 
+def push(title, content):
+    """如有推送渠道则额外推送; 没有就只 log, 不静默。"""
+    try:
+        from notify import send as _send
+        try:
+            _send(title, content)
+            return
+        except Exception as e:
+            log(f"[推送] notify.send 失败 (已忽略): {e}")
+    except Exception:
+        pass
+    try:
+        from sendNotify import send as _send2
+        try:
+            _send2(title, content)
+            return
+        except Exception as e:
+            log(f"[推送] sendNotify.send 失败 (已忽略): {e}")
+    except Exception:
+        pass
+    # 无推送渠道 —— 已在 log 中打印, 这里不再重复
+    log("[推送] 未配置推送渠道 (notify/sendNotify 均不可用), 仅本地日志。")
+
+
 def main():
+    log("=== 毫秒镜像签到 开始 ===")
     token, src = get_token()
     if not token:
-        send("毫秒镜像签到",
-             "❌ 未找到 token: 请先确保 login.py 定时任务正常运行 (早于本任务), "
-             "或在青龙环境变量里设置 MS_TOKEN 兜底。")
+        log("❌ 未找到 token: 来源=无")
+        log("   请确认宿主机 cron 的 login.py 已正常执行 (早于本任务), ")
+        log("   或在青龙环境变量设置 MS_TOKEN 兜底。")
+        push("毫秒镜像签到", "❌ 未找到 token")
         return
+    log(f"token 来源: {src} (长度 {len(token)})")
 
     st, resp = api_call("GET", STATUS_API, token)
+    log(f"GET {STATUS_API} -> HTTP {st}")
     if isinstance(resp, str):  # 出错文本
+        log(f"   响应文本: {resp[:300]}")
         if st in (401, 403):
-            send("毫秒镜像签到", "❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行 (需早于本任务)。")
+            log("❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行。")
+            push("毫秒镜像签到", "❌ 登录态失效 (401/403)")
         else:
-            send("毫秒镜像签到", f"⚠️ 状态接口返回异常 (HTTP {st}): {resp[:200]}")
+            log(f"⚠️ 状态接口返回异常 (HTTP {st})")
+            push("毫秒镜像签到", f"⚠️ 状态接口异常 (HTTP {st})")
         return
 
     sdata = resp.get("data", {})
     today = sdata.get("today")
+    log(f"   今日={today} 今日已签={sdata.get('today_checked')} "
+        f"连续={sdata.get('continuous_days')} 累计={sdata.get('total_days')}")
     if sdata.get("today_checked"):
         msg = (f"✅ {today} 今日已签到\n"
                f"连续 {sdata.get('continuous_days')} 天 / 累计 {sdata.get('total_days')} 天")
-        send("毫秒镜像签到", msg)
+        log(msg.replace("\n", " | "))
+        push("毫秒镜像签到", msg)
         return
 
+    log("尚未签到, 发起 POST 签到...")
     cst, cresp = api_call("POST", CHECKIN_API, token, {})
+    log(f"POST {CHECKIN_API} -> HTTP {cst}")
     if isinstance(cresp, str):
+        log(f"   响应文本: {cresp[:300]}")
         if cst in (401, 403):
-            send("毫秒镜像签到", "❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行。")
+            log("❌ 登录态失效 (401/403)。")
+            push("毫秒镜像签到", "❌ 登录态失效 (401/403)")
         else:
-            send("毫秒镜像签到", f"⚠️ 签到返回异常 (HTTP {cst}): {cresp[:200]}")
+            log(f"⚠️ 签到返回异常 (HTTP {cst})")
+            push("毫秒镜像签到", f"⚠️ 签到异常 (HTTP {cst})")
         return
 
     if cst == 200 and cresp.get("code") == 0:
         rd = cresp.get("data", {})
         msg = (f"🎉 {today} 签到成功\n"
                f"连续 {rd.get('continuous_days')} 天 / 累计 {rd.get('total_days')} 天")
-        send("毫秒镜像签到", msg)
+        log(msg.replace("\n", " | "))
+        push("毫秒镜像签到", msg)
     else:
-        send("毫秒镜像签到", f"⚠️ 签到返回异常: {cresp}")
+        log(f"⚠️ 签到返回非预期: code={cresp.get('code')} msg={cresp.get('message')} raw={cresp}")
+        push("毫秒镜像签到", f"⚠️ 签到异常: {cresp}")
+    log("=== 毫秒镜像签到 结束 ===")
 
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
