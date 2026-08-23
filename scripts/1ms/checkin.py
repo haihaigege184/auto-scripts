@@ -3,36 +3,63 @@
 """
 毫秒镜像 (1ms.run) 每日签到 —— 青龙版（纯标准库 urllib，无第三方依赖）
 
+优化目标: 最大程度模拟真实用户浏览器操作, 降低风控触发概率。
+  - 使用真实浏览器 User-Agent + 完整请求头 (Accept / Accept-Language / sec-fetch-* / DNT)
+  - 使用 cookiejar 维护会话 cookie (先 GET 签到页暖场, 再请求 API, 像真人先开页再点)
+  - 登录 -> 查状态 -> 签到 之间加入随机人为延迟 (2~6s), 避免瞬间连发
+  - 优先用账号密码自动登录拿新 token (不依赖可能过期的静态 token 文件)
+  - 签到前先探测 /api/v1/captcha/params 的 enabled:
+       enabled=false -> 直接带空 captchaTicket 签到 (真人豁免路径)
+       enabled=true  -> 不再硬撞 (硬撞会持续触发风控), 改为提醒手动签到
+
 读 token 顺序:
-  1. 文件 (默认 /ql/data/1ms_token.txt, 或同目录 .token, 可用 MS_TOKEN_FILE 覆盖)
-     —— 该文件由 login.py (宿主机 cron 定时任务) 自动刷新
-  2. 环境变量 MS_TOKEN  (手动填的兜底)
-接口鉴权: Authorization: Bearer <auth_token>
+  1. 环境变量 MS_TOKEN (手动兜底)
+  2. 文件 (默认 /ql/data/1ms_token.txt, 或同目录 .token, 可用 MS_TOKEN_FILE 覆盖)
+账号密码 (用于自动登录刷新 token):
+  MS_PHONE / MS_PASSWORD
 
 青龙环境变量:
-  MS_PHONE / MS_PASSWORD  —— 给 login.py 用 (取/刷新 token, 跑在宿主机 cron)
-  (可选) MS_TOKEN_FILE    —— 指定 token 文件位置 (默认见上)
+  MS_PHONE / MS_PASSWORD  —— 自动登录用 (推荐配置, 避免 token 过期)
+  (可选) MS_TOKEN_FILE    —— token 文件位置
   (可选) MS_TOKEN         —— 手动兜底 token
+  (可选) MS_WEBHOOK_URL   —— 推送到 SEA2 机器人 (私发管理员)
+  (可选) MS_LOG_FILE      —— 本地日志路径
 
-定时 (青龙容器内): 20 7 * * *  (每天 07:20, 需晚于宿主机 login 的 08:55 前一天刷新)
-
-日志策略: 无论是否配置推送渠道, 全程用 print 输出到 stdout (青龙日志可见),
-          并额外写一份本地日志文件 (MS_LOG_FILE 或默认 /ql/data/1ms_checkin.log),
-          绝不静默, 手动运行也能看到完整过程。
+定时 (青龙容器内): 20 7 * * *
 """
+
 import os
 import sys
 import json
+import time
+import random
 import datetime
 import urllib.request
 import urllib.error
+import http.cookiejar
 
 BASE = "https://1ms.run"
 
+# 真实浏览器请求头模板 (Chrome 149 Win10)
+BASE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": BASE + "/user/checkin",
+    "Origin": BASE,
+    "sec-ch-ua": '"Chromium";v="149", "Not)A;Brand";v="24", "Google Chrome";v="149"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "DNT": "1",
+}
+
 
 def load_env_file():
-    """青龙 task 命令不注入 Envs 表也不 source env.sh, 这里手动解析 /ql/data/config/env.sh。
-    仅当对应变量尚未在环境中存在时才注入 (不覆盖已有值)。"""
+    """青龙 task 不注入 Envs 也不 source env.sh, 手动解析 /ql/data/config/env.sh。"""
     candidates = [
         "/ql/data/config/env.sh",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "env.sh"),
@@ -58,8 +85,6 @@ def load_env_file():
                         os.environ[k] = v
         except Exception:
             pass
-STATUS_API = "/api/v1/mall/checkin/status"
-CHECKIN_API = "/api/v1/mall/checkin"
 
 
 def log_path():
@@ -72,7 +97,6 @@ def log_path():
 
 
 def log(msg):
-    """打屏 (青龙日志可见) + 写本地日志文件。"""
     line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line, flush=True)
     try:
@@ -80,6 +104,13 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def human_delay(lo=2.0, hi=6.0):
+    """模拟真人操作间隔的随机停顿。"""
+    d = random.uniform(lo, hi)
+    time.sleep(d)
+    return d
 
 
 def token_file_path():
@@ -91,46 +122,106 @@ def token_file_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token")
 
 
-def get_token():
+def save_token(tok):
+    """把自动登录拿到的新 token 写回文件, 供下次复用。"""
+    try:
+        tp = token_file_path()
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(tok)
+        log(f"token 已刷新写入: {tp}")
+    except Exception as e:
+        log(f"写入 token 文件失败 (忽略): {e}")
+
+
+def get_static_token():
     tp = token_file_path()
     if os.path.exists(tp):
         try:
             v = open(tp, "r", encoding="utf-8").read().strip()
             if v:
-                return v, "file:" + tp
-        except Exception as e:
-            log(f"读取 token 文件失败 {tp}: {e}")
-    v = os.environ.get("MS_TOKEN", "").strip()
-    if v:
-        return v, "env:MS_TOKEN"
-    return None, None
+                return v
+        except Exception:
+            pass
+    return os.environ.get("MS_TOKEN", "").strip()
 
 
-def api_call(method, path, token, data=None):
+def make_opener():
+    """带 cookiejar 的 opener, 维护会话 cookie。"""
+    cj = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj)), cj
+
+
+def api_call(opener, method, path, token=None, data=None, timeout=20):
     """返回 (status_code, obj_or_text)。"""
     url = BASE + path
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "Referer": BASE + "/user/checkin",
-        "Origin": BASE,
-        "Accept": "application/json",
-        "Authorization": "Bearer " + token,
-        "Content-Type": "application/json",
-    }
+    headers = dict(BASE_HEADERS)
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status, json.loads(r.read().decode("utf-8"))
+        with opener.open(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "ignore")
+            try:
+                return r.status, json.loads(raw)
+            except Exception:
+                return r.status, raw
     except urllib.error.HTTPError as e:
         txt = e.read().decode("utf-8", "ignore") if e.fp else ""
-        return e.code, txt
-    except Exception as e:  # 网络错误等
-        return -1, str(e)
+        try:
+            return e.code, json.loads(txt)
+        except Exception:
+            return e.code, txt
+    except Exception as e:
+        return -1, f"{type(e).__name__}: {e}"
+
+
+def warmup_page(opener):
+    """先 GET 签到页 HTML, 让服务端种下会话 cookie (模拟真人先开页面)。"""
+    try:
+        req = urllib.request.Request(BASE + "/user/checkin", headers=dict(BASE_HEADERS), method="GET")
+        with opener.open(req, timeout=20) as r:
+            return r.status
+    except Exception as e:
+        log(f"  暖场 GET 签到页失败 (忽略): {e}")
+        return -1
+
+
+def auto_login(opener):
+    """用账号密码自动登录, 返回 (token, err)。"""
+    phone = os.environ.get("MS_PHONE", "").strip()
+    pwd = os.environ.get("MS_PASSWORD", "").strip()
+    if not phone or not pwd:
+        return None, "未配置 MS_PHONE / MS_PASSWORD, 无法自动登录"
+    st, resp = api_call(opener, "POST", "/api/v1/auth/login",
+                        data={"account": phone, "password": pwd})
+    if isinstance(resp, dict) and resp.get("code") == 0:
+        tok = (resp.get("data") or {}).get("token")
+        if tok:
+            return tok, None
+    msg = resp.get("msg", "") if isinstance(resp, dict) else str(resp)
+    return None, f"自动登录失败 HTTP={st} msg={msg}"
+
+
+def get_valid_token(opener):
+    """优先用静态 token, 失效则自动登录刷新。返回 (token, src, err)。"""
+    tok = get_static_token()
+    if tok:
+        # 探测静态 token 是否还有效
+        st, resp = api_call(opener, "GET", "/api/v1/mall/checkin/status", token=tok)
+        if isinstance(resp, dict) and resp.get("code") not in (401, 403):
+            return tok, "static", None
+        log("  静态 token 失效, 尝试自动登录刷新...")
+    tok, err = auto_login(opener)
+    if tok:
+        save_token(tok)
+        return tok, "auto-login", None
+    return None, None, err
 
 
 def push(title, content, level="ok"):
-    """推送顺序: 青龙原生 notify/sendNotify  ->  自建 webhook (SEA2 机器人转发群)  ->  兜底只 log。"""
     pushed = False
     try:
         from notify import send as _send
@@ -150,21 +241,16 @@ def push(title, content, level="ok"):
             log(f"[推送] sendNotify.send 失败 (已忽略): {e}")
     except Exception:
         pass
-    # 自建 webhook: 把消息推到 SEA2 机器人 -> 通知群 (纯 urllib, 无依赖)
     wh = os.environ.get("MS_WEBHOOK_URL", "").strip()
     if wh:
         try:
-            import urllib.parse
             data = json.dumps({
                 "title": title,
                 "content": content,
                 "level": level,
             }).encode("utf-8")
             req = urllib.request.Request(
-                wh,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST")
+                wh, data=data, headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as r:
                 log(f"[推送] webhook 已发送 (HTTP {r.status})")
                 pushed = True
@@ -176,25 +262,33 @@ def push(title, content, level="ok"):
 
 def main():
     load_env_file()
-    log("=== 毫秒镜像签到 开始 ===")
-    token, src = get_token()
+    log("=== 毫秒镜像签到 开始 (真人模拟模式) ===")
+
+    opener, _ = make_opener()
+
+    # 1) 暖场: 先打开签到页, 种会话 cookie
+    warmup_page(opener)
+    human_delay(1.5, 3.5)
+
+    # 2) 获取有效 token
+    token, src, err = get_valid_token(opener)
     if not token:
-        log("❌ 未找到 token: 来源=无")
-        log("   请确认宿主机 cron 的 login.py 已正常执行 (早于本任务), ")
-        log("   或在青龙环境变量设置 MS_TOKEN 兜底。")
-        push("毫秒镜像签到", "❌ 未找到 token", level="error")
+        log("❌ 未找到有效 token: " + str(err))
+        push("毫秒镜像签到", "❌ 未找到有效 token (请配置 MS_PHONE/MS_PASSWORD 自动登录)", level="error")
         return
     log(f"token 来源: {src} (长度 {len(token)})")
 
-    st, resp = api_call("GET", STATUS_API, token)
-    log(f"GET {STATUS_API} -> HTTP {st}")
-    if isinstance(resp, str):  # 出错文本
+    # 3) 查签到状态 (像真人进页面先看今天签没签)
+    human_delay(2.0, 5.0)
+    st, resp = api_call(opener, "GET", "/api/v1/mall/checkin/status", token=token)
+    log(f"GET status -> HTTP {st}")
+    if isinstance(resp, str):
         log(f"   响应文本: {resp[:300]}")
         if st in (401, 403):
-            log("❌ 登录态失效 (401/403)。请确认 login.py 定时任务正常执行。")
+            log("❌ 登录态失效。请确认 MS_PHONE/MS_PASSWORD 正确。")
             push("毫秒镜像签到", "❌ 登录态失效 (401/403)", level="error")
         else:
-            log(f"⚠️ 状态接口返回异常 (HTTP {st})")
+            log(f"⚠️ 状态接口异常 (HTTP {st})")
             push("毫秒镜像签到", f"⚠️ 状态接口异常 (HTTP {st})", level="warn")
         return
 
@@ -209,12 +303,36 @@ def main():
         push("毫秒镜像签到", msg, level="ok")
         return
 
-    log("尚未签到, 发起 POST 签到...")
-    cst, cresp = api_call("POST", CHECKIN_API, token, {})
-    log(f"POST {CHECKIN_API} -> HTTP {cst}")
+    # 4) 探测验证码开关 (关键: 不硬撞风控)
+    human_delay(1.0, 3.0)
+    cst, cresp = api_call(opener, "POST", "/api/v1/captcha/params", token=token,
+                          data={"scene": "checkin"})
+    captcha_enabled = False
+    if isinstance(cresp, dict) and cresp.get("code") == 0:
+        captcha_enabled = bool((cresp.get("data") or {}).get("enabled"))
+    log(f"验证码探测: enabled={captcha_enabled}")
+
+    if captcha_enabled:
+        # 服务端强制验证码 -> 不再硬撞 (硬撞会持续触发风控), 提醒手动
+        log("⚠️ 服务端当前开启验证码风控, 脚本无法自动过验证码 (腾讯云真人验证)。")
+        log("   已按最低风控策略跳过自动签到, 请在网页/App 手动完成今日签到。")
+        push("毫秒镜像签到",
+             f"⚠️ {today} 今日需手动签到\n服务端开启验证码风控, 脚本已自动跳过以免触发更严限制。\n请到 1ms.run 网页或 App 手动点一下签到。",
+             level="warn")
+        return
+
+    # 5) 未开启验证码 -> 模拟真人点击签到 (带随机延迟)
+    log("尚未签到且无需验证码, 发起 POST 签到...")
+    human_delay(2.0, 5.0)
+    cst, cresp = api_call(opener, "POST", "/api/v1/mall/checkin", token=token,
+                          data={"captchaTicket": ""})
+    log(f"POST checkin -> HTTP {cst}")
     if isinstance(cresp, str):
         log(f"   响应文本: {cresp[:300]}")
-        if cst in (401, 403):
+        if "验证码" in cresp or cst == 400:
+            log("⚠️ 服务端仍要求验证码, 脚本跳过 (避免硬撞风控)。")
+            push("毫秒镜像签到", f"⚠️ {today} 服务端要求验证码\n脚本已自动跳过, 请手动签到。", level="warn")
+        elif cst in (401, 403):
             log("❌ 登录态失效 (401/403)。")
             push("毫秒镜像签到", "❌ 登录态失效 (401/403)", level="error")
         else:
@@ -222,15 +340,21 @@ def main():
             push("毫秒镜像签到", f"⚠️ 签到异常 (HTTP {cst})", level="warn")
         return
 
-    if cst == 200 and cresp.get("code") == 0:
+    if cst == 200 and isinstance(cresp, dict) and cresp.get("code") == 0:
         rd = cresp.get("data", {})
         msg = (f"🎉 {today} 签到成功\n"
                f"连续 {rd.get('continuous_days')} 天 / 累计 {rd.get('total_days')} 天")
         log(msg.replace("\n", " | "))
         push("毫秒镜像签到", msg, level="ok")
     else:
-        log(f"⚠️ 签到返回非预期: code={cresp.get('code')} msg={cresp.get('message')} raw={cresp}")
-        push("毫秒镜像签到", f"⚠️ 签到异常: {cresp}", level="warn")
+        code = cresp.get("code") if isinstance(cresp, dict) else "?"
+        msg = cresp.get("msg") if isinstance(cresp, dict) else str(cresp)
+        log(f"⚠️ 签到返回非预期: code={code} msg={msg}")
+        # 若服务端突然要求验证码, 不刷屏报错, 温和提示
+        if "验证码" in str(msg):
+            push("毫秒镜像签到", f"⚠️ {today} 服务端要求验证码\n脚本已自动跳过, 请手动签到。", level="warn")
+        else:
+            push("毫秒镜像签到", f"⚠️ 签到异常: code={code} msg={msg}", level="warn")
     log("=== 毫秒镜像签到 结束 ===")
 
 
