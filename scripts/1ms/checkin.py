@@ -15,15 +15,24 @@
 读 token 顺序:
   1. 环境变量 MS_TOKEN (手动兜底)
   2. 文件 (默认 /ql/data/1ms_token.txt, 或同目录 .token, 可用 MS_TOKEN_FILE 覆盖)
-账号密码 (用于自动登录刷新 token):
+  3. 设备授权 (若设 MS_DEVICE_CODE, 提交授权码+网页批准后拿 token, 最稳不触发登录风控)
+账号密码 (用于自动登录刷新 token, 兜底):
   MS_PHONE / MS_PASSWORD
 
 青龙环境变量:
-  MS_PHONE / MS_PASSWORD  —— 自动登录用 (推荐配置, 避免 token 过期)
+  MS_PHONE / MS_PASSWORD  —— 自动登录用 (兜底, 可能触发验证码风控)
+  (可选) MS_DEVICE_CODE   —— 设备授权 8 位授权码; 设了且 token 失效时自动走设备授权
+  (可选) MS_DEVICE_NAME   —— 设备授权设备名 (展示用, 默认 QingLong)
+  (可选) MS_DEVICE_INFO   —— 设备授权设备信息 (展示用, 默认 Linux)
   (可选) MS_TOKEN_FILE    —— token 文件位置
   (可选) MS_TOKEN         —— 手动兜底 token
   (可选) MS_WEBHOOK_URL   —— 推送到 SEA2 机器人 (私发管理员)
   (可选) MS_LOG_FILE      —— 本地日志路径
+
+设备授权 (推荐, 免密码免登录验证码):
+  用户去 https://1ms.run/user?menu=10 生成 8 位授权码, 设 MS_DEVICE_CODE=该码,
+  下次签到会自动提交并在网页批准后写入 token 文件; 或直接跑 device_auth.py <授权码>。
+  授权成功后即可清除 MS_DEVICE_CODE, 日常签到复用该 token。
 
 定时 (青龙容器内): 20 7 * * *
 """
@@ -205,15 +214,57 @@ def auto_login(opener):
     return None, f"自动登录失败 HTTP={st} msg={msg}"
 
 
+def device_auth(opener, code):
+    """设备授权一次性拿 token: 提交授权码 -> 轮询直到批准。返回 (token, err)。"""
+    secure_key = os.urandom(32).hex()
+    device_name = os.environ.get("MS_DEVICE_NAME", "QingLong")
+    device_info = os.environ.get("MS_DEVICE_INFO", "Linux")
+    st, resp = api_call(opener, "POST", "/api/v1/auth/device/request",
+                        data={"code": code, "device_name": device_name,
+                              "device_info": device_info, "secure_key": secure_key})
+    if not (isinstance(resp, dict) and resp.get("code") == 0):
+        msg = resp.get("msg") if isinstance(resp, dict) else str(resp)
+        return None, f"设备授权请求失败 HTTP={st} msg={msg}"
+    log("  设备授权请求已提交, 等待网页批准...")
+    for i in range(36):
+        time.sleep(5)
+        pst, presp = api_call(
+            opener, "GET", f"/api/v1/auth/device/poll/{code}?secure_key={secure_key}")
+        if isinstance(presp, dict) and presp.get("code") == 0:
+            d = presp.get("data", {})
+            s = d.get("status")
+            if s == "approved" and d.get("token"):
+                return d["token"], None
+            if s == "rejected":
+                return None, "授权被拒绝"
+            if s == "expired":
+                return None, "授权已过期"
+        else:
+            msg = presp.get("msg") if isinstance(presp, dict) else str(presp)
+            if "过期" in str(msg) or "expired" in str(msg).lower():
+                return None, "授权已过期"
+    return None, "授权超时 (请确认已在网页点 [批准])"
+
+
 def get_valid_token(opener):
-    """优先用静态 token, 失效则自动登录刷新。返回 (token, src, err)。"""
+    """优先用静态 token, 失效则: 设备授权(若设 MS_DEVICE_CODE) -> 自动登录刷新。
+    返回 (token, src, err)。"""
     tok = get_static_token()
     if tok:
         # 探测静态 token 是否还有效
         st, resp = api_call(opener, "GET", "/api/v1/mall/checkin/status", token=tok)
         if isinstance(resp, dict) and resp.get("code") not in (401, 403):
             return tok, "static", None
-        log("  静态 token 失效, 尝试自动登录刷新...")
+        log("  静态 token 失效, 尝试刷新...")
+    # 设备授权 (一次性, 需用户在网页批准; 获批后写入 token 文件供日后复用)
+    dcode = os.environ.get("MS_DEVICE_CODE", "").strip()
+    if dcode:
+        log("  检测到 MS_DEVICE_CODE, 尝试设备授权获取 token ...")
+        dtok, derr = device_auth(opener, dcode)
+        if dtok:
+            save_token(dtok)
+            return dtok, "device-auth", None
+        log(f"  设备授权失败: {derr} (回退自动登录)")
     tok, err = auto_login(opener)
     if tok:
         save_token(tok)
