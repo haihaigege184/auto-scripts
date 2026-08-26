@@ -6,7 +6,9 @@
 技术路线 (已验证可行):
   - 登录: 设备授权 token 当 auth_token cookie 直接登录 (1ms.run 接受)
   - 触发: 访问 /user/checkin, 点"签到"按钮 -> 弹腾讯云天御滑块 (turing.captcha.gtimg.com drag_ele)
-  - 识别: 截背景图 (.tc-bg-img) + 滑块图 (.tcaptcha-drag-wrap), cv2.matchTemplate 找缺口 X
+  - 识别: 截背景图 (.tc-bg-img) + 自动挑选真正的拼图块元素 (NCC 自验证, 避免误用滑块把手),
+           cv2.matchTemplate 找缺口 X
+  - 支持: 滑块型 (drag_ele) + 点击顺序型 (click_order "请依次点击：4 2 1")
   - 拖动: 在 page 坐标系 mouse.down + 多步 move (cosine ease-in-out + 末段过冲回拉 + 微抖动) -> up
   - 回调: 腾讯云验证通过后回调 captchaTicket 给 1ms, 自动完成签到
   - 后续: 该 ticket 用于 1ms 的 /api/v1/mall/checkin (captchaTicket 字段)
@@ -94,6 +96,115 @@ def find_gap(bg_path: str, slider_path: str, skip_x_max: int = 0,
     best_local = int(np.argmax(score))
     best_i = int(order[best_local])
     return int(xs[best_i]), float(res[ys[best_i], xs[best_i]]), float(darks[best_i])
+
+
+# ============== 1.5) 缺口识别 (方差法: 洞=背景被抠掉后留下的最平滑块) ==============
+def find_gap_var(bg_path: str, piece_x_in_bg: int, piece_y_in_bg: int,
+                 piece_w: int, piece_h: int, skip_x_max: int = 0):
+    """拼图块是前景图标, 与背景场景纹理不相似 (NCC 仅 0.3), 纯模板匹配无效。
+    真正信号: 背景图里"被抠掉图标"的位置 = 最平滑(低方差)的块 = 洞。
+    在拼图块所在 y 带内滑窗, 找局部方差最小且不在拼图块自身位置的 x。
+    返回: (gap_x, min_var) 或 (None, inf)
+    """
+    bg = cv2.imread(bg_path)
+    if bg is None:
+        return None, float("inf")
+    g = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bh, bw = g.shape[:2]
+    y0 = max(0, int(piece_y_in_bg) - 6)
+    y1 = min(bh, int(piece_y_in_bg) + int(piece_h) + 6)
+    if y1 - y0 < 12:
+        y0, y1 = 0, bh
+    band = g[y0:y1, :]
+    pw = int(piece_w)
+    if pw <= 0 or pw > bw or (y1 - y0) < 12:
+        return None, float("inf")
+    best_x, best_v = None, float("inf")
+    for x in range(0, bw - pw):
+        if skip_x_max and x < skip_x_max:
+            continue
+        win = band[:, x:x + pw]
+        v = float(win.var())
+        if v < best_v:
+            best_v = v
+            best_x = x
+    return best_x, best_v
+
+
+# ============== 1.6) 缺口识别 (轮廓对比法: 洞内平滑 + 洞外有纹理) ==============
+def find_gap_sil(bg_path: str, piece_png: str, piece_x_in_bg: int,
+                 piece_y_in_bg: int, piece_w: int, piece_h: int, skip_x_max: int = 0):
+    """用拼图块的"轮廓(mask)"在背景里滑窗:
+       洞的特征 = mask 内部背景平滑(图标被抠掉) + mask 外部仍有场景纹理。
+       评分 score = var(外部) - var(内部), 取最大。
+       比纯方差法更稳: 自然平滑区(天空/水面)内外都平滑, 评分低; 只有洞内外对比强。
+    要求 piece_png 带 alpha (pick_piece 返回的 raw 截图即带 alpha)。
+    返回: (gap_x, best_score) 或 (None, 0)
+    """
+    bg = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)
+    if bg is None:
+        return None, 0.0
+    bg = bg.astype(np.float32)
+    bh, bw = bg.shape
+    sl = cv2.imread(piece_png, cv2.IMREAD_UNCHANGED)
+    if sl is None or sl.shape[2] != 4:
+        return None, 0.0
+    mask = (sl[:, :, 3] > 100)  # 拼图块轮廓 (bool)
+    mh, mw = mask.shape
+    if mh < 8 or mw < 8:
+        return None, 0.0
+    y0 = int(piece_y_in_bg)
+    if y0 < 0 or y0 + mh > bh:
+        y0 = max(0, min(bh - mh, y0))
+    best_x, best_score = None, -1e18
+    for x in range(0, bw - mw + 1):
+        if skip_x_max and x < skip_x_max:
+            continue
+        region = bg[y0:y0 + mh, x:x + mw]
+        inside = region[mask]
+        outside = region[~mask]
+        if inside.size == 0 or outside.size == 0:
+            continue
+        var_in = float(inside.var())
+        var_out = float(outside.var())
+        score = var_out - var_in
+        if score > best_score:
+            best_score = score
+            best_x = x
+    return best_x, best_score
+
+
+# ============== 1.7) 缺口识别 (最暗窗口法: 缺口是 bg 上的深色半透明拼图形状) ==============
+def find_gap_dark(bg_path: str, piece_y: int, piece_w: int, piece_h: int,
+                  skip_x_min: int = 0, band_pad: int = 4):
+    """缺口在 bg 上是半透明深色拼图形状, 在 piece 的 y 带内, 找 piece_w 宽窗口的
+    最小灰度均值 x = 缺口左边缘。
+    已在 t2/t3 真实截图验证: t2 gap_x=168 mean=56 (带均82.8), t3 gap_x=177 mean=64 (带均152.7).
+    skip_x_min: 跳过 x < skip_x_min (排除拼图块自身位置, 防止白边残留)。
+    返回: (gap_x, mean) 或 (None, inf)
+    """
+    img = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None, float("inf")
+    img = img.astype(np.float32)
+    bh, bw = img.shape
+    y0 = max(0, int(piece_y) - band_pad)
+    y1 = min(bh, int(piece_y + piece_h) + band_pad)
+    if y1 - y0 < 8:
+        return None, float("inf")
+    band = img[y0:y1, :]
+    pw = int(piece_w)
+    if pw <= 0 or pw > bw:
+        return None, float("inf")
+    best_x, best_m = None, float("inf")
+    for x in range(0, bw - pw):
+        if x < int(skip_x_min):
+            continue
+        m = float(band[:, x:x + pw].mean())
+        if m < best_m:
+            best_m = m
+            best_x = x
+    return best_x, best_m
 
 
 # ============== 2) 人类轨迹 (cosine ease + 末段过冲 + 抖动) ==============
@@ -218,6 +329,105 @@ def _dump_slider_state(frame, sl_loc, prefix: str = "dump"):
     print(f"[dump] {prefix}: " + _json.dumps(out, ensure_ascii=False, default=str)[:1500], flush=True)
 
 
+def pick_piece(frame, bg_path: str, bg_box: dict):
+    """自动挑选真正的拼图块元素。
+
+    旧版固定用 .tc-fg-item.tc-slider-normal 截图当模板, 但该元素实测是 65x35 滑块把手,
+    导致 NCC match 仅 0.356 永远过不了。
+    改进: 枚举所有候选 (.tc-fg-item / IMG.tc-slider-bg / canvas / 含 slider/drag class),
+    各自截图后与背景图做 cv2.matchTemplate, 选 NCC 自匹配最佳者 = 真正的拼图块。
+    同时偏好 bbox 中心落在背景图区域内 (piece 叠加在 bg 上, 把手在 bg 下方) 且比把手高的候选。
+    返回: (loc, bbox, sl_path, max_val, on_bg) 或 None
+    """
+    bg = cv2.imread(bg_path)
+    if bg is None:
+        return None
+    bh, bw = bg.shape[:2]
+    sels = [".tc-fg-item", "IMG.tc-slider-bg", ".tc-slider-bg", "canvas",
+            "[class*='slider']", "[class*='drag']", "[class*='piece']", "[class*='fg']"]
+    cands = []
+    for sel in sels:
+        try:
+            n = frame.locator(sel).count()
+        except Exception:
+            continue
+        for i in range(n):
+            try:
+                loc = frame.locator(sel).nth(i)
+                bb = loc.bounding_box()
+            except Exception:
+                continue
+            if not bb or bb.get("width", 0) <= 0:
+                continue
+            cands.append((loc, bb, sel, i))
+    if not cands:
+        return None
+    best = None
+    best_score = -2.0
+    stamp = int(time.time() * 1000)
+    for loc, bb, sel, i in cands:
+        try:
+            p = f"/tmp/_ms_pcand_{stamp}_{i}.png"
+            loc.screenshot(path=p)
+            sl = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            if sl is None:
+                continue
+            if sl.shape[2] == 4:
+                sl3 = sl[:, :, :3].copy()
+                mask = sl[:, :, 3] > 128
+                if mask.any():
+                    mean = sl3[mask].mean(axis=0).astype(np.uint8)
+                    sl3[~mask] = mean
+            else:
+                sl3 = sl
+            sh, sw = sl3.shape[:2]
+            if sh <= 0 or sw <= 0 or sh > bh or sw > bw:
+                continue
+            res = cv2.matchTemplate(bg, sl3, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+            cx = bb["x"] + bb["width"] / 2
+            cy = bb["y"] + bb["height"] / 2
+            on_bg = (bg_box["x"] <= cx <= bg_box["x"] + bg_box["width"] and
+                     bg_box["y"] <= cy <= bg_box["y"] + bg_box["height"])
+            score = mv + (0.25 if on_bg else 0.0)
+            if bb["height"] > bb["width"]:   # 拼图块通常比把手高
+                score += 0.05
+            if score > best_score:
+                best_score = score
+                best = (loc, bb, p, mv, on_bg)
+        except Exception:
+            continue
+    return best
+
+
+def find_puzzle_piece(frame):
+    """找到真正的拼图块 (61x61, bg=url turing), 排除把手 (66x35 .tc-slider-normal)
+    和底部轨道 (340x16)。
+    旧版 pick_piece 用 NCC 自验证, 实际会把把手/轨道混进来, 错位 y 带导致缺口定位全错。
+    尺寸过滤最稳: 拼图块 bbox 宽高都在 40~80, 且 class 不含 slider-normal。
+    """
+    try:
+        n = frame.locator(".tc-fg-item").count()
+    except Exception:
+        return None, None
+    for i in range(n):
+        loc = frame.locator(".tc-fg-item").nth(i)
+        try:
+            bb = loc.bounding_box()
+            if not bb:
+                continue
+            w, h = int(bb["width"]), int(bb["height"])
+            if not (40 <= w <= 80 and 40 <= h <= 80):
+                continue
+            cls = (loc.get_attribute("class") or "")
+            if "slider-normal" in cls:
+                continue
+            return loc, bb
+        except Exception:
+            continue
+    return None, None
+
+
 def solve_slide_in_frame(page, frame) -> dict:
     """
     在腾讯云天御滑块 iframe 内:
@@ -253,6 +463,9 @@ def solve_slide_in_frame(page, frame) -> dict:
         # bg 已加载但无 fg-item, 可能是点击型, 识别为非滑块
         if h and h > 50 and cnt == 0 and i >= 6:  # 等 3s 确认非滑块
             instr = frame.evaluate("() => { const e=document.getElementById('instructionText'); return e ? e.textContent.trim() : ''; }")
+            if "点击" in instr or "依次" in instr or "click" in (instr or "").lower():
+                print(f"  [slide] 检测到点击顺序型, 转交 click_order 解法 (instruction='{instr}')", flush=True)
+                return solve_click_order_in_frame(page, frame)
             print(f"  [slide] 非滑块型 (无 .tc-fg-item) bg_h={h:.0f} instruction='{instr}' (等待 {i*0.5:.1f}s)", flush=True)
             break
         time.sleep(0.5)
@@ -270,108 +483,352 @@ def solve_slide_in_frame(page, frame) -> dict:
         # bg 加载但无 fg-item = 点击型, 抛特殊异常让 main 走 A 保底
         raise NonSliderError(f"今日 1ms 抽中非滑块型验证 (instr='{instr}'), 走 A 保底")
 
-    # 滑块元素: 候选多个 class (1ms 模板版本可能不同)
-    slider_candidates = [
-        ".tc-fg-item.tc-slider-normal",
-        ".tc-fg-item",
-        ".tc-slider-normal",
-        "[class*='slider']",
-        "[class*='drag']",
-    ]
-    sl_loc = None
-    for sel in slider_candidates:
-        try:
-            loc = frame.locator(sel).first
-            if loc.count() > 0:
-                loc.wait_for(state="attached", timeout=3000)
-                bb = loc.bounding_box()
-                if bb and bb.get("width", 0) > 0:
-                    sl_loc = loc
-                    print(f"  [slide] 滑块定位成功 selector='{sel}' box={bb}", flush=True)
-                    break
-        except Exception:
-            continue
-
-    if not sl_loc:
-        _dump_slider_state(frame, bg_loc, prefix="no_slider_selector")
-        raise RuntimeError("所有 slider 候选选择器都未找到有效元素")
-
     time.sleep(1.0)  # 滑块渐入完成
 
     bg_path = "/tmp/_ms_bg.png"
-    sl_path = "/tmp/_ms_sl.png"
-    bg_loc.screenshot(path=bg_path)
+    # 关键: 截图前先隐藏拼图块 overlay, 否则 .tc-bg-img 截图会包含拼图块自身,
+    #       导致 matchTemplate 出现 ncc=1.0 自匹配陷阱 (piece 在 bg 上的当前位置被当成"完美匹配")
     try:
-        sl_loc.screenshot(path=sl_path)
+        frame.evaluate("() => { document.querySelectorAll('.tc-fg-item').forEach(e=>{ e.dataset._h=e.style.display; e.style.display='none'; }); }")
+        bg_loc.screenshot(path=bg_path)
+        frame.evaluate("() => { document.querySelectorAll('.tc-fg-item').forEach(e=>{ e.style.display=e.dataset._h||''; }); }")
     except Exception as e:
-        _dump_slider_state(frame, sl_loc, prefix="screenshot_fail")
-        raise
-
-    # bounding_box 轮询 5 次 (attached 不保证 size>0)
-    sl_box = None
-    for _ in range(5):
-        sl_box = sl_loc.bounding_box()
-        if sl_box and sl_box.get("width", 0) > 0:
-            break
-        time.sleep(0.5)
-    if not sl_box or sl_box.get("width", 0) == 0:
-        _dump_slider_state(frame, sl_loc, prefix="bbox_fail")
-        raise RuntimeError(f"slider bounding_box unavailable: {sl_box}")
-
-    # 排除自匹配区: bg 内涂 noise + skip_x_max 双保险
-    # 1) bg 涂黑 piece 区域 (避免自匹配完美分)
-    # 2) skip_x_max 兜底 (x < piece_x_in_bg + piece_w + 15 直接跳过)
+        print(f"  [slide] 隐藏拼图块失败, 退回原图: {e}", flush=True)
+        bg_loc.screenshot(path=bg_path)
     bg_box = bg_loc.bounding_box()
-    piece_x_in_bg = max(0, int(sl_box["x"] - bg_box["x"]))
-    piece_y_in_bg = max(0, int(sl_box["y"] - bg_box["y"]))
-    piece_w = int(sl_box["width"])
-    piece_h = int(sl_box["height"])
-    skip_x_max = piece_x_in_bg + piece_w + 15
-    print(f"  [slide] 排除自匹配: 涂noise ({piece_x_in_bg},{piece_y_in_bg},{piece_w},{piece_h}) + skip x<{skip_x_max}", flush=True)
+    print(f"  [slide] bg_box={bg_box}", flush=True)
 
-    gap_x, max_val, max_dark = find_gap(
-        bg_path, sl_path,
-        skip_x_max=skip_x_max,
-        mask_rect=(piece_x_in_bg, piece_y_in_bg, piece_w, piece_h),
-    )
-    slider_w = sl_box["width"]
-    slider_cx = sl_box["x"] + slider_w / 2
-    slider_cy = sl_box["y"] + sl_box["height"] / 2
-    gap_cx = bg_box["x"] + gap_x + slider_w / 2
-    dist = gap_cx - slider_cx
+    # 关键改进: 找真正的 61x61 拼图块 (不是 66x35 把手, 不是 340x16 底部轨道)
+    # 旧版 pick_piece + NCC 自验证 实际会把把手/轨道选进来, 错位 y 带 -> 缺口定位全错.
+    pp_loc, pp_box = find_puzzle_piece(frame)
+    if not pp_loc:
+        _dump_slider_state(frame, bg_loc, prefix="no_puzzle_piece")
+        raise RuntimeError("未能识别 61x61 拼图块")
+    print(f"  [slide] 拼图块 piece_box={pp_box}", flush=True)
 
-    print(f"  [slide] gap_x={gap_x} match_val={max_val:.3f} dark={max_dark:.1f} "
-          f"slider=({slider_cx:.0f},{slider_cy:.0f}) dist={dist:.1f}", flush=True)
+    # 重新截 bg_box (可能有微动) 并算 piece 在 bg 内坐标
+    bg_box = bg_loc.bounding_box()
+    piece_x_in_bg = max(0, int(pp_box["x"] - bg_box["x"]))
+    piece_y_in_bg = max(0, int(pp_box["y"] - bg_box["y"]))
+    piece_w = int(pp_box["width"])
+    piece_h = int(pp_box["height"])
+    skip_x = piece_x_in_bg + piece_w + 5
+    print(f"  [slide] piece_in_bg=({piece_x_in_bg},{piece_y_in_bg}) wh=({piece_w},{piece_h}) "
+          f"skip x<{skip_x}", flush=True)
 
-    # 模拟人手: 移到滑块上 -> 按下 -> 多步 move (steps 模拟平滑) -> up
-    page.mouse.move(slider_cx, slider_cy, steps=4)
-    time.sleep(0.15 + random.random() * 0.1)
+    # 缺口定位: piece y 带内 piece_w 宽窗口的最小灰度均值 = 缺口左边缘.
+    # 缺口是 bg 上的半透明深色拼图形状 (t2 验证 gap_mean=56 vs band_mean=82.8).
+    gap_x, gap_mean = find_gap_dark(bg_path, piece_y_in_bg, piece_w, piece_h, skip_x_min=skip_x)
+    if gap_x is None:
+        raise RuntimeError("find_gap_dark 未找到缺口")
+    band_arr = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)[piece_y_in_bg:piece_y_in_bg + piece_h, :]
+    band_mean = float(band_arr.mean()) if band_arr is not None else 0.0
+    print(f"  [slide] 缺口 gap_x={gap_x} gap_mean={gap_mean:.1f} band_mean={band_mean:.1f} "
+          f"contrast={band_mean - gap_mean:.1f}", flush=True)
+
+    # 拖动距离: 腾讯云 drag_ele 校验的是"滑块把手" (handle) 的位移, 不是拼图块.
+    # handle 起点 x 与 piece 起点 x 在 bg 内坐标不同 (实测 handle_x_in_bg=23, piece_x_in_bg=25, 差 2px),
+    # 用 piece_x_in_bg 当起点会少拖 2px -> 拼图块永远差 2px 到不了缺口 -> 永远被拒.
+    # 故必须用 handle 自己的起点: dist = gap_x - handle_x_in_bg.
+    handle_box = None
+    try:
+        hloc = frame.locator(".tc-fg-item.tc-slider-normal").first
+        handle_box = hloc.bounding_box()
+    except Exception:
+        pass
+    if handle_box and bg_box:
+        handle_x_in_bg = max(0, int(handle_box["x"] - bg_box["x"]))
+    else:
+        handle_x_in_bg = piece_x_in_bg  # 兜底
+    dist = float(gap_x - handle_x_in_bg)
+    print(f"  [slide] 起点用 handle: handle_x_in_bg={handle_x_in_bg} piece_x_in_bg={piece_x_in_bg} "
+          f"gap_x={gap_x} dist={dist:.1f} (旧 piece 法会少 {piece_x_in_bg - handle_x_in_bg}px)", flush=True)
+
+    # 拖动起点: 优先用 .tc-fg-item.tc-slider-normal 把手 (66x35, 底部蓝条)
+    slider_cx, slider_cy = None, None
+    try:
+        hloc = frame.locator(".tc-fg-item.tc-slider-normal").first
+        hb = hloc.bounding_box()
+        if hb and hb.get("width", 0) > 0:
+            slider_cx = hb["x"] + hb["width"] / 2
+            slider_cy = hb["y"] + hb["height"] / 2
+    except Exception:
+        pass
+    if slider_cx is None:
+        # 兜底: 拼图块中心 (但 1ms 拼图块不响应拖动, 会失败)
+        slider_cx = pp_box["x"] + pp_box["width"] / 2
+        slider_cy = pp_box["y"] + pp_box["height"] / 2
+    print(f"  [slide] dist={dist:.1f} handle=({slider_cx:.0f},{slider_cy:.0f})", flush=True)
+
+    # 模拟人手: 慢启动 + 变速 + 微抖动 + 末段长停留, 规避腾讯云轨迹风控.
+    # 旧版 7 个完美 waypoint + steps=8 仍被判 bot; 改用 50+ 微步, 每步 steps=4 平滑内插,
+    # 速度用 ease-in-out + 高斯噪声, y 轴带相关微抖, 末段停留 0.6-0.9s 再释放.
+    page.mouse.move(slider_cx, slider_cy, steps=8)
+    time.sleep(0.25 + random.random() * 0.1)
     page.mouse.down()
-    time.sleep(0.1)
-    pts = human_track(dist, steps=random.randint(26, 34), jitter=0.8)
-    cum_x, cum_y = 0.0, 0.0
-    for i, (dx, dy) in enumerate(pts):
-        # 每步 move 距离 = 当前 - 上一
-        step_dx = dx - cum_x
-        step_dy = dy - cum_y
-        cum_x, cum_y = dx, dy
-        page.mouse.move(slider_cx + dx, slider_cy + dy, steps=1)
-        time.sleep(0.012 + random.random() * 0.012)
-    time.sleep(0.25 + random.random() * 0.15)
+    time.sleep(0.15 + random.random() * 0.08)
+    n_steps = 55
+    t = np.linspace(0.0, 1.0, n_steps)
+    ease = 0.5 * (1 - np.cos(np.pi * t))  # cosine ease-in-out
+    # 速度噪声: 真实人手速度有 ±20% 波动
+    vel_noise = np.random.normal(0.0, 0.004, n_steps)
+    xs = [0.0]
+    for i in range(1, n_steps):
+        # base 位置 + 累积噪声 (让轨迹有自然波动)
+        base = ease[i] * dist
+        # 中段加微抖动, 末段抑制
+        if 3 < i < n_steps - 4:
+            jitter = float(np.random.uniform(-0.6, 0.6))
+        else:
+            jitter = 0.0
+        xs.append(base + jitter)
+    xs[-1] = float(dist)  # 最终严格停在 dist
+    # 逐步移动
+    for i in range(1, n_steps):
+        tx = slider_cx + xs[i]
+        # y 微抖: 跟 x 进度相关 (中段大, 两端小), 模拟人手弧线
+        progress = xs[i] / dist if dist else 0
+        y_wobble = math.sin(progress * math.pi) * random.uniform(-0.7, 0.7)
+        ty = slider_cy + y_wobble
+        page.mouse.move(tx, ty, steps=4)
+        time.sleep(0.035 + random.random() * 0.04)
+    # 末段长停留 (0.6-0.9s): 真实人手到位后会"确认一下"再松手
+    time.sleep(0.6 + random.random() * 0.3)
+    # 末段验证: 同时检查 把手(handle) 和 拼图块(piece) 的最终位置,
+    # 看哪个更接近 gap. 腾讯云 drag_ele 校验的是把手位移.
+    try:
+        cur_p = pp_loc.bounding_box()
+        cur_h = frame.locator(".tc-fg-item.tc-slider-normal").first.bounding_box()
+        if cur_p and cur_h and bg_box:
+            p_xbg = cur_p['x'] - bg_box['x']
+            h_xbg = cur_h['x'] - bg_box['x']
+            print(f"  [slide] pre-up handle_x_in_bg={h_xbg:.0f} piece_x_in_bg={p_xbg:.0f} "
+                  f"gap={gap_x} (handle->gap err {h_xbg-gap_x:+.1f}, piece->gap err {p_xbg-gap_x:+.1f})", flush=True)
+    except Exception as ex:
+        print(f"  [slide] pre-up check err: {ex}", flush=True)
     page.mouse.up()
 
-    return {"gap_x": gap_x, "dist": dist, "max_val": max_val, "max_dark": max_dark}
+    return {"gap_x": gap_x, "dist": dist, "gap_mean": gap_mean, "band_mean": band_mean}
+
+
+# ============== 4.5) 点击顺序型 (click_order) 验证码 ==============
+def solve_click_order_in_frame(page, frame) -> dict:
+    """1ms 点击顺序型验证码 (腾讯云天御 click_order):
+       指令形如 '请依次点击：4 2 1', 画面有多个带数字编号的图标, 需按序点击。
+       解析指令数字序列 -> 找到每个数字对应的图标 -> 按序点击 -> (若有) 点确认。
+    """
+    import re as _re
+    instr = ""
+    try:
+        instr = frame.evaluate("() => { const e=document.getElementById('instructionText'); return e? e.textContent.trim():''; }")
+    except Exception:
+        pass
+    if not instr:
+        try:
+            instr = frame.inner_text("body")[:160]
+        except Exception:
+            pass
+    print(f"  [click_order] instruction='{instr}'", flush=True)
+
+    # 解析点击序列: 取冒号后所有 token (数字 或 中文标签, 如 '4 2 1' 或 '邦 辈 筹')
+    seq_tokens = []
+    m = _re.search(r"[：:]\s*([\dA-Za-z\u4e00-\u9fff]+(?:\s+[\dA-Za-z\u4e00-\u9fff]+)+)", instr)
+    if m:
+        seq_tokens = m.group(1).split()
+    if not seq_tokens:
+        # 兜底: 直接取冒号后全部非空 token
+        parts = _re.split(r"[：:]", instr)
+        if len(parts) > 1:
+            seq_tokens = [t for t in parts[-1].split() if t.strip()]
+    if not seq_tokens:
+        raise NonSliderError(f"无法从指令解析点击序列: '{instr}'")
+    print(f"  [click_order] 点击序列 tokens={seq_tokens}", flush=True)
+
+    # 等图标出现
+    time.sleep(1.0)
+    try:
+        frame.locator(".tc-bg-img").first.wait_for(state="attached", timeout=8000)
+    except Exception:
+        pass
+    time.sleep(1.5)
+
+    # 收集图标目标: 候选 .tc-fg-item / img / 含 fg/icon/target 元素, 读标签文本
+    targets = []  # (label, locator, bbox, sel)
+    for sel in [".tc-fg-item", "img", "[class*='fg']", "[class*='icon']",
+                "[class*='target']", "[class*='click']", "canvas", "button"]:
+        try:
+            n = frame.locator(sel).count()
+        except Exception:
+            continue
+        for i in range(n):
+            try:
+                loc = frame.locator(sel).nth(i)
+                bb = loc.bounding_box()
+                if not bb or bb.get("width", 0) < 5:
+                    continue
+                txt = ""
+                try:
+                    txt = (loc.inner_text(timeout=800) or "").strip()
+                except Exception:
+                    txt = ""
+                if not txt:
+                    try:
+                        txt = (loc.get_attribute("alt") or "").strip()
+                    except Exception:
+                        pass
+                targets.append((txt, loc, bb, sel))
+            except Exception:
+                continue
+    print(f"  [click_order] 候选目标数={len(targets)}", flush=True)
+    for t in targets[:24]:
+        print(f"    - label='{t[0]}' sel={t[3]} bbox={t[2]}", flush=True)
+
+    # 建立 标签->目标 映射 (label 去掉空白后与 token 直接比对)
+    label_map = {}
+    for txt, loc, bb, sel in targets:
+        key = (txt or "").strip()
+        if key:
+            label_map[key] = (loc, bb)
+    print(f"  [click_order] 标签映射 keys={list(label_map.keys())}", flush=True)
+
+    if not label_map:
+        raise NonSliderError(f"click_order 未能识别任何带标签图标 (候选 {len(targets)} 但无标签)")
+
+    # 按 seq 顺序点击 (token 与 label 精确匹配, 支持数字或中文)
+    clicked = 0
+    for idx, tok in enumerate(seq_tokens):
+        tok = tok.strip()
+        if tok in label_map:
+            loc, bb = label_map[tok]
+            cx = bb["x"] + bb["width"] / 2
+            cy = bb["y"] + bb["height"] / 2
+            page.mouse.move(cx, cy, steps=3)
+            time.sleep(0.1 + random.random() * 0.1)
+            page.mouse.click(cx, cy)
+            clicked += 1
+            print(f"  [click_order] 点击 #{idx+1} token='{tok}' at ({cx:.0f},{cy:.0f})", flush=True)
+            time.sleep(0.6 + random.random() * 0.4)
+        else:
+            print(f"  [click_order] 序列 token '{tok}' 未找到对应图标 (keys={list(label_map.keys())})", flush=True)
+    if clicked == 0:
+        raise NonSliderError(f"click_order 序列 {seq_tokens} 全部未命中图标")
+
+    # 点完可能需要确认
+    try:
+        for sel in ["button:has-text('确定')", "button:has-text('验证')",
+                    ".tc-verify-btn", ".verify-btn", "[class*='verify']"]:
+            el = frame.locator(sel).first
+            if el.count() and el.is_visible():
+                el.click(timeout=3000)
+                print(f"  [click_order] 点击确认按钮 {sel}", flush=True)
+                break
+    except Exception as e:
+        print(f"  [click_order] 确认按钮点击异常(可忽略): {e}", flush=True)
+    return {"seq": seq, "clicked": clicked}
+
+
+def solve_captcha(page, frame) -> dict:
+    """按 iframe 内特征分发到滑块 / 点击顺序 两种解法"""
+    instr = ""
+    try:
+        instr = frame.evaluate("() => { const e=document.getElementById('instructionText'); return e? e.textContent.trim():''; }")
+    except Exception:
+        pass
+    has_slider = (frame.locator(".tc-fg-item.tc-slider-normal").count() > 0 or
+                  frame.locator(".tc-slider-bg").count() > 0)
+    if has_slider:
+        return solve_slide_in_frame(page, frame)
+    if "点击" in instr or "click" in instr.lower() or "依次" in instr:
+        return solve_click_order_in_frame(page, frame)
+    # 未知型: 交给滑块逻辑最后判定 (其内部会在非滑块时抛 NonSliderError 走 A 保底)
+    return solve_slide_in_frame(page, frame)
 
 
 # ============== 5) 端到端主流程 (明天未签时跑) ==============
+def _write_status(status, detail=""):
+    """写结果状态文件 + 打印 A 保底横幅。供 ql/cron/手动运行后快速判断。
+    status: SUCCESS / ALREADY / MANUAL (需手动 A 保底)
+    """
+    try:
+        with open("F:/ai/ql-scripts/_ms_status.txt", "w", encoding="utf-8") as f:
+            f.write(f"{status}\t{detail}\t{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except Exception:
+        pass
+    if status == "SUCCESS":
+        print("[A保底] ✅ 自动过码成功, 今日已签", flush=True)
+    elif status == "ALREADY":
+        print("[A保底] ℹ️ 今日已签, 无需重复", flush=True)
+    else:
+        print("[A保底] ⚠️ 自动化未通过, 需手动签到 (A 保底): https://1ms.run/user/checkin", flush=True)
+        print(f"[A保底]   原因: {detail}", flush=True)
+
+
 def run_checkin():
     tok = load_token_from_container()
     print(f"[main] token loaded (len={len(tok)})", flush=True)
+    status, detail = "MANUAL", ""
 
     with sync_playwright() as p:
-        b = p.chromium.launch(headless=True)
+        # 反自动化检测: 腾讯云天御对 headless playwright 100% 拒绝 (即使拼图块精确落在缺口,
+        # 也会因 navigator.webdriver / 缺少 plugins / WebGL 特征等被判 bot).
+        # 加 --disable-blink-features=AutomationControlled + init script 双保险.
+        b = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-web-security",
+            ],
+        )
         ctx = b.new_context(viewport={"width": 1280, "height": 900}, user_agent=UA)
         ctx.add_cookies([{"name": "auth_token", "value": tok, "domain": "." + DOMAIN, "path": "/"}])
+        # init script: 隐藏 webdriver + 补齐 plugins/languages/chrome.runtime/WebGL, 伪装成真实 Chrome
+        ctx.add_init_script("""
+            (() => {
+                try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e) {}
+                try { Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] }); } catch(e) {}
+                try {
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => {
+                            const arr = [
+                                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+                                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+                                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+                                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+                                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', length: 1 },
+                            ];
+                            arr.length = 5;
+                            return arr;
+                        }
+                    });
+                } catch(e) {}
+                try {
+                    window.chrome = {
+                        runtime: { onInstalled: { addListener: () => {} }, sendMessage: () => {}, connect: () => {} },
+                        loadTimes: () => ({}),
+                        csi: () => ({}),
+                        app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+                    };
+                } catch(e) {}
+                try {
+                    const origQuery = navigator.permissions && navigator.permissions.query;
+                    if (origQuery) {
+                        navigator.permissions.query = (p) =>
+                            p && p.name === 'notifications'
+                                ? Promise.resolve({ state: Notification.permission || 'default' })
+                                : origQuery.call(navigator.permissions, p);
+                    }
+                } catch(e) {}
+                try {
+                    const gp = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(p) {
+                        if (p === 37445) return 'Intel Inc.';
+                        if (p === 37446) return 'Intel Iris OpenGL Engine';
+                        return gp.call(this, p);
+                    };
+                } catch(e) {}
+            })();
+        """)
         page = ctx.new_page()
 
         page.goto(f"https://{DOMAIN}/user/checkin", wait_until="domcontentloaded", timeout=30000)
@@ -381,7 +838,8 @@ def run_checkin():
         if "今日已签" in body:
             print("[main] 今日已签, 无需重复 (脚本退出)", flush=True)
             b.close()
-            return
+            _write_status("ALREADY", "今日已签")
+            return "ALREADY"
         # 找签到按钮: 多种策略兜底 (get_by_text 偶尔匹到非按钮元素)
         clicked = False
         strategies = [
@@ -411,7 +869,8 @@ def run_checkin():
             except Exception:
                 pass
             b.close()
-            return
+            _write_status("MANUAL", "找不到立即签到按钮")
+            return "MANUAL"
 
         # 等滑块 iframe 出现 (重试定位, 并区分滑块型/点击型)
         slide_frame = None
@@ -433,18 +892,27 @@ def run_checkin():
             body_now = page.inner_text("body")
             if "今日已签" in body_now:
                 print("[main] 今日已签 (弹窗未起, 无需重复)", flush=True)
+                b.close()
+                _write_status("ALREADY", "今日已签(弹窗未起)")
+                return "ALREADY"
             else:
                 print("[main] NON_SLIDER_OR_NO_FRAME (可能抽中点击/图文验证, 本路线仅支持滑块, 走A保底)", flush=True)
                 page.screenshot(path="/tmp/_ms_nonslide.png")
-            b.close()
-            return
+                try:
+                    import shutil
+                    shutil.copy("/tmp/_ms_nonslide.png", f"F:/ai/_ms_nonslide_{int(time.time())}.png")
+                except Exception:
+                    pass
+                b.close()
+                _write_status("MANUAL", "抽中非滑块型/无frame")
+                return "MANUAL"
 
         print("[main] 找到滑块 iframe, 开始过滑块 (最多3次)...", flush=True)
         success = False
         non_slider_early = False
         for attempt in range(1, 4):
             try:
-                solve_slide_in_frame(page, slide_frame)
+                solve_captcha(page, slide_frame)
             except NonSliderError as e:
                 # 1ms 抽中非滑块型 (click_order 等), 走 A 保底, 不再重试
                 print(f"[main] ⚠️ {e}", flush=True)
@@ -483,11 +951,15 @@ def run_checkin():
                 print(f"[main] attempt {attempt} 未成功, 重试...", flush=True)
                 page.wait_for_timeout(1500)
         page.screenshot(path="/tmp/_ms_after.png")
-        if not success and not non_slider_early:
-            print("[main] ⚠️ 多次尝试未成功, 看 /tmp/_ms_after.png (A保底: 需手动签到)", flush=True)
+        if success:
+            status = "SUCCESS"; detail = "滑块过码成功"
         elif non_slider_early:
-            print("[main] NON_SLIDER: 今日 1ms 抽中非滑块型 (如点击顺序), 滑块路线不适用, 走 A 保底手动签到", flush=True)
+            status = "MANUAL"; detail = "抽中非滑块型(点击顺序), 滑块路线不适用"
+        else:
+            status = "MANUAL"; detail = "滑块多次尝试未成功(腾讯云风控拒绝 headless)"
         b.close()
+        _write_status(status, detail)
+        return status
 
 
 # ============== 6) selftest: 独立验证 cv2 缺口识别 + 轨迹生成 ==============
@@ -538,7 +1010,8 @@ if __name__ == "__main__":
     if args.selftest:
         selftest()
     elif args.checkin:
-        run_checkin()
+        st = run_checkin()
+        sys.exit(0 if st in ("SUCCESS", "ALREADY") else 2)
     else:
         # 默认: 先 selftest 再询问 (避免误触签到)
         selftest()
