@@ -745,8 +745,20 @@ def solve_captcha(page, frame) -> dict:
 
 
 # ============== 5) 端到端主流程 (明天未签时跑) ==============
+def _ql_notify(title, content):
+    """青龙环境内调用面板自带 sendNotify 推给管理员; 非青龙环境(本机调试)静默跳过。
+    仅 best-effort: import 失败/无 sendNotify 一律 pass, 不影响主流程。
+    """
+    try:
+        from notify import sendNotify
+        if callable(sendNotify):
+            sendNotify(title, content)
+    except Exception:
+        pass
+
+
 def _write_status(status, detail=""):
-    """写结果状态文件 + 打印 A 保底横幅。供 ql/cron/手动运行后快速判断。
+    """写结果状态文件 + 打印 A 保底横幅 + (青龙环境)推管理员。供 ql/cron/手动运行后快速判断。
     status: SUCCESS / ALREADY / MANUAL (需手动 A 保底)
     """
     try:
@@ -761,6 +773,8 @@ def _write_status(status, detail=""):
     else:
         print("[A保底] ⚠️ 自动化未通过, 需手动签到 (A 保底): https://1ms.run/user/checkin", flush=True)
         print(f"[A保底]   原因: {detail}", flush=True)
+        # 需手动 = 必须让管理员知道, 青龙环境下显式推一遍 (面板也会捕获 stdout)
+        _ql_notify("1ms签到 A保底", f"自动化未过码, 需手动签到:\nhttps://1ms.run/user/checkin\n原因: {detail}")
 
 
 def run_checkin():
