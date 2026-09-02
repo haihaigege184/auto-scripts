@@ -30,8 +30,8 @@
   装依赖一键脚本: start_chrome_qinglong.sh (apt/apk 装 xvfb+chromium 并起常驻).
 
 用法:
-  python3 _checkin_slide.py            # 端到端签到 (明天未签时跑)
-  python3 _checkin_slide.py --selftest # 只验证 cv2 缺口识别 + 轨迹生成 (无需登录)
+  python3 checkin_slide.py            # 端到端签到 (明天未签时跑)
+  python3 checkin_slide.py --selftest # 只验证 cv2 缺口识别 + 轨迹生成 (无需登录)
 """
 import os, sys, time, math, random, argparse
 import numpy as np
@@ -1152,4 +1152,4 @@ if __name__ == "__main__":
     else:
         # 默认: 先 selftest 再询问 (避免误触签到)
         selftest()
-        print("\n如需端到端签到, 跑: python3 _checkin_slide.py --checkin", flush=True)
+        print("\n如需端到端签到, 跑: python3 checkin_slide.py --checkin", flush=True)

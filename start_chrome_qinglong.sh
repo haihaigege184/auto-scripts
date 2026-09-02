@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在【青龙容器内部】预备真实浏览器环境 (只需跑一次, 或作为青龙"依赖"任务执行)
-# 用途: 让 _checkin_slide.py 能用"真实 chromium + CDP"过天御, 全程不依赖宿主机.
+# 用途: 让 checkin_slide.py 能用"真实 chromium + CDP"过天御, 全程不依赖宿主机.
 set -e
 
 echo "[1/3] 安装 xvfb + chromium ..."

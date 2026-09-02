@@ -8,7 +8,7 @@ import os, sys, time, json
 import numpy as np
 import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _checkin_slide import load_token_from_container
+from checkin_slide import load_token_from_container
 from playwright.sync_api import sync_playwright
 
 HOST = "10.0.0.11"
