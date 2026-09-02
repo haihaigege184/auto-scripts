@@ -15,12 +15,30 @@ else
   echo "未知包管理器, 请手动安装 xvfb + chromium"; exit 1
 fi
 
+echo "[1.5/3] 安装 Python 依赖 (numpy / cv2 / paramiko / playwright) ..."
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get install -y python3-numpy python3-opencv python3-paramiko 2>/dev/null || true
+  python3 -m pip install --break-system-packages playwright 2>/dev/null \
+    || pip3 install playwright 2>/dev/null \
+    || echo "⚠️ playwright 安装失败, 请在青龙依赖管理补 playwright"
+elif command -v apk >/dev/null 2>&1; then
+  # Alpine(musl) 用系统包: opencv-python-headless 的 manylinux wheel 在 musl 上装不上
+  apk add --no-cache py3-numpy py3-opencv py3-paramiko py3-pip
+  python3 -m pip install --break-system-packages --no-cache-dir playwright 2>/dev/null \
+    || pip3 install --break-system-packages --no-cache-dir playwright 2>/dev/null \
+    || echo "⚠️ playwright 安装失败, 请在青龙依赖管理补 playwright"
+fi
+python3 -c "import numpy, cv2, paramiko, playwright; print('依赖检查: numpy/cv2/paramiko/playwright OK')" 2>&1 || true
+
 echo "[2/3] 启动常驻 chromium (CDP :9222) ..."
 CHROME_BIN=$(command -v chromium || command -v chromium-browser \
              || command -v google-chrome || command -v google-chrome-stable)
 if [ -z "$CHROME_BIN" ]; then
   echo "找不到 chromium 可执行文件"; exit 1
 fi
+# 清理旧实例, 避免重复占用 9222
+pkill -f "remote-debugging-port=9222" 2>/dev/null || true
+sleep 1
 mkdir -p /ql/data/chrome_prof
 
 # 无桌面环境用 xvfb 包一层 (headed 真实浏览器); 有 DISPLAY 直接 headed
