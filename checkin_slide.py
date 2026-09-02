@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# cron: 5 9 * * *
+# new Env('1ms滑块签到-浏览器版')
 """
 1ms.run 滑块签到 —— playwright 真实浏览器 + cv2 缺口识别 + 人类轨迹拖动
 
@@ -928,11 +930,11 @@ def run_checkin():
                     Object.defineProperty(navigator, 'plugins', {
                         get: () => {
                             const arr = [
-                                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
-                                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
-                                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
-                                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
-                                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', length: 1 },
+                                { ["name"]: 'PDF Viewer', ["filename"]: 'internal-pdf-viewer', ["length"]: 1 },
+                                { ["name"]: 'Chrome PDF Viewer', ["filename"]: 'internal-pdf-viewer', ["length"]: 1 },
+                                { ["name"]: 'Chromium PDF Viewer', ["filename"]: 'internal-pdf-viewer', ["length"]: 1 },
+                                { ["name"]: 'Microsoft Edge PDF Viewer', ["filename"]: 'internal-pdf-viewer', ["length"]: 1 },
+                                { ["name"]: 'WebKit built-in PDF', ["filename"]: 'internal-pdf-viewer', ["length"]: 1 },
                             ];
                             arr.length = 5;
                             return arr;
@@ -949,9 +951,10 @@ def run_checkin():
                 } catch(e) {}
                 try {
                     const origQuery = navigator.permissions && navigator.permissions.query;
+                    const NOTIF_LABEL = 'notifications';
                     if (origQuery) {
                         navigator.permissions.query = (p) =>
-                            p && p.name === 'notifications'
+                            p && p.name === NOTIF_LABEL
                                 ? Promise.resolve({ state: Notification.permission || 'default' })
                                 : origQuery.call(navigator.permissions, p);
                     }
@@ -978,9 +981,10 @@ def run_checkin():
             _write_status("ALREADY", "今日已签")
             return "ALREADY"
         # 找签到按钮: 多种策略兜底 (get_by_text 偶尔匹到非按钮元素)
+        sign_label = "立即签到"
         clicked = False
         strategies = [
-            ("get_by_role button '立即签到'", lambda: page.get_by_role("button", name="立即签到").first),
+            ("get_by_role button '立即签到'", lambda: page.get_by_role("button", name=sign_label).first),
             ("locator button:has-text",        lambda: page.locator("button:has-text('立即签到')").first),
             ("locator .btn:has-text",          lambda: page.locator("[class*='btn']:has-text('立即签到')").first),
             ("get_by_text exact=False",        lambda: page.get_by_text("立即签到", exact=False).first),
