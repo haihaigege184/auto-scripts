@@ -22,11 +22,13 @@ if command -v apt-get >/dev/null 2>&1; then
     || pip3 install playwright 2>/dev/null \
     || echo "⚠️ playwright 安装失败, 请在青龙依赖管理补 playwright"
 elif command -v apk >/dev/null 2>&1; then
-  # Alpine(musl) 用系统包: opencv-python-headless 的 manylinux wheel 在 musl 上装不上
-  apk add --no-cache py3-numpy py3-opencv py3-paramiko py3-pip
-  python3 -m pip install --break-system-packages --no-cache-dir playwright 2>/dev/null \
-    || pip3 install --break-system-packages --no-cache-dir playwright 2>/dev/null \
-    || echo "⚠️ playwright 安装失败, 请在青龙依赖管理补 playwright"
+  # Alpine(musl): opencv 必须用系统包(py3-opencv, manylinux wheel 在 musl 装不上);
+  # numpy/paramiko/playwright 走 pip(配国内镜像, 否则默认 PyPI 不通), 装进任务实际用的那个 python3
+  MIRROR=${PIP_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}
+  apk add --no-cache py3-opencv py3-pip
+  python3 -m pip install -i "$MIRROR" --break-system-packages --no-cache-dir numpy paramiko playwright 2>&1 \
+    || pip3 install -i "$MIRROR" --break-system-packages --no-cache-dir numpy paramiko playwright 2>&1 \
+    || echo "⚠️ pip 安装失败, 请在青龙依赖管理补 numpy/paramiko/playwright"
 fi
 python3 -c "import numpy, cv2, paramiko, playwright; print('依赖检查: numpy/cv2/paramiko/playwright OK')" 2>&1 || true
 
