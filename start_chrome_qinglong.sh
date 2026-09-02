@@ -16,38 +16,38 @@ else
 fi
 
 echo "[1.5/3] 安装 Python 依赖 (numpy / cv2 / paramiko / playwright) ..."
+# pip 参数: aliyun 主镜像 + Tsinghua 兜底; 不配 pypi.org(容器里不通, 会死等超时, 拖成 10 分钟)
+PIPI="-i https://mirrors.aliyun.com/pypi/simple --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple --retries 1 --timeout 20"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get install -y python3-numpy python3-opencv python3-paramiko 2>/dev/null || true
   python3 -m pip install --break-system-packages playwright 2>/dev/null \
     || pip3 install playwright 2>/dev/null \
     || echo "⚠️ playwright 安装失败, 请在青龙依赖管理补 playwright"
 elif command -v apk >/dev/null 2>&1; then
-  # Alpine(musl): numpy/cv2/paramiko 用系统包(py3-*)装进【任务实际用的系统 python3】
-  #   opencv 的 manylinux wheel 在 musl 上装不上, 只能 apk
-  # playwright 只能 pip, 且逐个装(任一失败不影响其它); 多镜像兜底(Tsinghua 对 playwright 偶发返回空)
+  # Alpine(musl): 先 apk 拿 numpy/paramiko/opencv; 再逐个 pip 补(一个失败不影响其它)
   apk add --no-cache py3-numpy py3-opencv py3-paramiko py3-pip
-  for PKG in numpy paramiko playwright; do
-    python3 -m pip install --break-system-packages --no-cache-dir \
-      -i https://mirrors.aliyun.com/pypi/simple \
-      --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-      --extra-index-url https://pypi.org/simple \
-      "$PKG" 2>&1 | tail -2 \
-      || echo "⚠️ $PKG 安装失败(若青龙依赖管理已有可忽略)"
+  for PKG in numpy paramiko playwright opencv-python-headless; do
+    python3 -m pip install --break-system-packages --no-cache-dir $PIPI "$PKG" \
+      >/tmp/pip_$PKG.log 2>&1 || echo "⚠️ $PKG pip 安装失败(可忽略)"
+    tail -1 /tmp/pip_$PKG.log 2>/dev/null || true
   done
 fi
-python3 -c "import numpy, cv2, paramiko, playwright; print('系统 python3 依赖检查: numpy/cv2/paramiko/playwright OK')" 2>&1 || true
 
-# 兜底桥接: 若青龙把依赖装在别的 python(如 /ql/py3), 把系统 site-packages 桥接过去, 让它能 import cv2
-for PY in $(find /ql -maxdepth 4 -name python3 -path "*/bin/*" 2>/dev/null); do
-  if $PY -c "import playwright" >/dev/null 2>&1; then
-    SP=$($PY -c "import site;print(site.getsitepackages()[0])" 2>/dev/null)
-    SYS_SP=$(python3 -c "import site;print(site.getsitepackages()[0])" 2>/dev/null)
-    if [ -n "$SP" ] && [ -n "$SYS_SP" ] && [ "$SP" != "$SYS_SP" ]; then
-      echo "$SYS_SP" > "$SP/zz_qinglong_sys.pth"
-      echo "已桥接: $PY 现可从系统 site-packages 导入 cv2"
+# cv2 兜底: apk 的 py3-opencv 装到了【另一个 python 前缀】(如 /usr/lib/python3.x),
+# 用 .pth 把那个 site-packages 桥接进任务实际用的 python(opencv 的 manylinux wheel 在 musl 装不上, 不能只靠 pip)
+if ! python3 -c "import cv2" >/dev/null 2>&1; then
+  CV2_DIR=$(find /usr /lib /opt /ql -maxdepth 7 -type d -name cv2 -path "*site-packages*" 2>/dev/null | head -1)
+  if [ -n "$CV2_DIR" ]; then
+    SP=$(python3 -c "import site;print(site.getsitepackages()[0])" 2>/dev/null)
+    SYS_SP=$(dirname "$CV2_DIR")
+    if [ -n "$SP" ] && [ "$SP" != "$SYS_SP" ]; then
+      echo "$SYS_SP" > "$SP/zz_cv2_bridge.pth" 2>/dev/null || true
+      echo "已桥接 cv2: $SYS_SP -> $SP"
     fi
   fi
-done
+fi
+python3 -c "import numpy, cv2, paramiko, playwright; print('依赖检查 OK: numpy/cv2/paramiko/playwright')" 2>&1 \
+  || echo "⚠️ 仍有依赖缺失(见上一行), 签到任务 import 会失败"
 
 echo "[2/3] 启动常驻 chromium (CDP :9222) ..."
 CHROME_BIN=$(command -v chromium || command -v chromium-browser \
@@ -60,22 +60,33 @@ pkill -f "remote-debugging-port=9222" 2>/dev/null || true
 sleep 1
 mkdir -p /ql/data/chrome_prof
 
-# 无桌面环境用 xvfb 包一层 (headed 真实浏览器); 有 DISPLAY 直接 headed
+# 无桌面环境: 自己拉起 Xvfb
+# 注意: Alpine 的 xvfb 包只有 Xvfb 二进制, 往往没有 xvfb-run 脚本, 不能依赖 command -v xvfb-run
+if [ -z "$DISPLAY" ] && command -v Xvfb >/dev/null 2>&1; then
+  pkill -f "Xvfb :99" 2>/dev/null || true
+  setsid nohup Xvfb :99 -screen 0 1280x900x24 >/dev/null 2>&1 &
+  sleep 2
+  export DISPLAY=:99
+  echo "已启动 Xvfb :99"
+fi
+
 # setsid+nohup+disown: 脚本结束后 chromium 仍常驻(否则任务结束会被一起杀掉)
 LAUNCH_ARGS="--remote-debugging-port=9222 --no-sandbox --disable-dev-shm-usage --user-data-dir=/ql/data/chrome_prof --no-first-run --no-default-browser-check --disable-extensions"
-if [ -z "$DISPLAY" ] && command -v xvfb-run >/dev/null 2>&1; then
-  setsid nohup xvfb-run -a "$CHROME_BIN" $LAUNCH_ARGS >/ql/data/chrome.log 2>&1 &
-else
-  setsid nohup "$CHROME_BIN" $LAUNCH_ARGS >/ql/data/chrome.log 2>&1 &
-fi
+setsid nohup "$CHROME_BIN" $LAUNCH_ARGS >/ql/data/chrome.log 2>&1 &
 disown 2>/dev/null || true
 
 echo "[3/3] 给签到任务加环境变量后生效:"
 echo "      CHROME_CDP_URL=http://127.0.0.1:9222"
-# 等待 CDP 真正起来再返回, 避免任务结束早于浏览器就绪
-for i in $(seq 1 30); do
-  VER=$(curl -s http://127.0.0.1:9222/json/version 2>/dev/null | head -c 200)
-  if [ -n "$VER" ]; then echo "CDP 已就绪: $VER"; break; fi
+# 等待 CDP 真正起来再返回 (curl 带 --max-time, 避免连接挂起)
+VER=""
+for i in $(seq 1 40); do
+  VER=$(curl -s --max-time 3 http://127.0.0.1:9222/json/version 2>/dev/null | head -c 200)
+  if [ -n "$VER" ]; then break; fi
   sleep 0.5
 done
-[ -z "$VER" ] && echo "⚠️ CDP 未就绪, 查看 /ql/data/chrome.log"
+if [ -n "$VER" ]; then
+  echo "CDP 已就绪: $VER"
+else
+  echo "⚠️ CDP 未就绪, chrome.log 末尾:"
+  tail -10 /ql/data/chrome.log 2>/dev/null || true
+fi
