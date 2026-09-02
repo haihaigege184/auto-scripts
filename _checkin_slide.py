@@ -13,9 +13,18 @@
   - 回调: 腾讯云验证通过后回调 captchaTicket 给 1ms, 自动完成签到
   - 后续: 该 ticket 用于 1ms 的 /api/v1/mall/checkin (captchaTicket 字段)
 
-依赖 (已装): playwright + chromium, cv2(opencv-python-headless), numpy, paramiko
-运行环境: 需能开 chromium 的机器 (Windows/Debian 宿主机, 容器 Alpine 不行).
-        部署建议: 宿主机 10.0.0.11 用 cron 调起 (1ms 签到每日一次).
+依赖 (已装): playwright + 系统真实 Chrome, cv2(opencv-python-headless), numpy, paramiko
+运行环境: 必须用"真实浏览器环境"过天御 (headless playwright 被天御 100% 拒).
+  推荐: 宿主机常驻一个真 Chrome, 脚本经 CDP 接入:
+    xvfb-run -a google-chrome --remote-debugging-port=9222 \
+             --user-data-dir=/path/chrome-prof --no-first-run &
+    任务 env 设 CHROME_CDP_URL=http://127.0.0.1:9222
+  备选: 不设 CDP 时, 脚本自动用系统 Chrome (channel='chrome') headed 启动 + 持久 profile.
+  环境变量:
+    CHROME_CDP_URL      真实浏览器 DevTools 地址 (http://host:9222 或 ws://...), 优先
+    CHROME_PATH         显式 Chrome 可执行文件路径
+    CHROME_USER_DATA_DIR 持久 profile 目录 (累积真实使用痕迹, 更像真人)
+  兜底: 以上都不可用才回退 playwright headless (已知被天御拒, 仅本地调试).
 
 用法:
   python3 _checkin_slide.py            # 端到端签到 (明天未签时跑)
@@ -777,24 +786,94 @@ def _write_status(status, detail=""):
         _ql_notify("1ms签到 A保底", f"自动化未过码, 需手动签到:\nhttps://1ms.run/user/checkin\n原因: {detail}")
 
 
-def run_checkin():
-    tok = load_token_from_container()
-    print(f"[main] token loaded (len={len(tok)})", flush=True)
-    status, detail = "MANUAL", ""
+def _close(b, is_cdp):
+    """安全关闭: CDP 接入的真实浏览器只 disconnect (不 close, 否则会杀掉用户真浏览器)."""
+    if is_cdp:
+        try:
+            b.disconnect()
+        except Exception:
+            pass
+    else:
+        try:
+            _close(b, is_cdp)
+        except Exception:
+            pass
 
-    with sync_playwright() as p:
-        # 反自动化检测: 腾讯云天御对 headless playwright 100% 拒绝 (即使拼图块精确落在缺口,
-        # 也会因 navigator.webdriver / 缺少 plugins / WebGL 特征等被判 bot).
-        # 加 --disable-blink-features=AutomationControlled + init script 双保险.
-        b = p.chromium.launch(
+
+def launch_browser(p):
+    """'浏览器环境'方案启动/接入真实浏览器, 绕过天御对 headless playwright 的 100% 拒绝.
+
+    天御风险引擎靠 navigator.webdriver / cdc_ 注入 / 无头标记 / 缺 plugins·WebGL 等判 bot.
+    真实浏览器(用户自己开的 Chrome)这些特征都是"真人", 且 playwright 的自动化注入只发生在
+    launch() 时; 用 connect_over_cdp 接入的浏览器没有任何 playwright 痕迹.
+
+    优先级:
+      1) CHROME_CDP_URL 已设 (http://127.0.0.1:9222 或 ws://...) ->
+         connect_over_cdp 接入用户已开的真浏览器 (最稳, 零自动化特征)
+         部署: 宿主机 `xvfb-run -a google-chrome --remote-debugging-port=9222
+                --user-data-dir=/path/prof --no-first-run &`, 任务 env 设 CHROME_CDP_URL
+      2) 否则用系统真实 Chrome (channel='chrome' 或 CHROME_PATH) headed 启动 + 持久 user-data-dir
+         (需宿主机有显示器; 服务器用 xvfb-run 包一层)
+      3) 兜底: playwright 自带 chromium headless (原行为, 已知被天御拒, 仅本地调试)
+    返回 (browser, is_cdp)
+    """
+    cdp = os.environ.get("CHROME_CDP_URL") or os.environ.get("BROWSER_CDP_WS")
+    if cdp:
+        try:
+            print(f"[browser] 通过 CDP 接入真实浏览器: {cdp}", flush=True)
+            return p.chromium.connect_over_cdp(cdp), True
+        except Exception as e:
+            print(f"[browser] CDP 接入失败, 回退启动真实 Chrome: {e}", flush=True)
+
+    # 系统真实 Chrome (headed)
+    kw = dict(
+        headless=False,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ],
+    )
+    ud = os.environ.get("CHROME_USER_DATA_DIR")
+    if ud:
+        kw["user_data_dir"] = ud
+    ch = os.environ.get("CHROME_PATH")
+    if ch:
+        kw["executable_path"] = ch
+    else:
+        try:
+            kw["channel"] = "chrome"
+        except Exception:
+            pass
+    try:
+        print("[browser] 启动系统真实 Chrome (headed) ...", flush=True)
+        return p.chromium.launch(**kw), False
+    except Exception as e:
+        print(f"[browser] 真实 Chrome 启动失败 ({e}), 回退 playwright headless", flush=True)
+        return p.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--disable-web-security",
             ],
-        )
-        ctx = b.new_context(viewport={"width": 1280, "height": 900}, user_agent=UA)
+        ), False
+
+
+def run_checkin():
+    tok = load_token_from_container()
+    print(f"[main] token loaded (len={len(tok)})", flush=True)
+    status, detail = "MANUAL", ""
+
+    with sync_playwright() as p:
+        # '浏览器环境'方案: 优先接入/启动真实浏览器 (见 launch_browser), 不再用 playwright headless
+        b, is_cdp = launch_browser(p)
+        # 真实浏览器(CDP)用其默认 context; 自启动的建新 context + viewport
+        if is_cdp and b.contexts:
+            ctx = b.contexts[0]
+        else:
+            ctx = b.new_context(viewport={"width": 1280, "height": 900}, user_agent=UA)
         ctx.add_cookies([{"name": "auth_token", "value": tok, "domain": "." + DOMAIN, "path": "/"}])
         # init script: 隐藏 webdriver + 补齐 plugins/languages/chrome.runtime/WebGL, 伪装成真实 Chrome
         ctx.add_init_script("""
@@ -851,7 +930,7 @@ def run_checkin():
         body = page.inner_text("body")
         if "今日已签" in body:
             print("[main] 今日已签, 无需重复 (脚本退出)", flush=True)
-            b.close()
+            _close(b, is_cdp)
             _write_status("ALREADY", "今日已签")
             return "ALREADY"
         # 找签到按钮: 多种策略兜底 (get_by_text 偶尔匹到非按钮元素)
@@ -882,7 +961,7 @@ def run_checkin():
                 shutil.copy("/tmp/_ms_no_btn.png", f"F:/ai/_ms_no_btn_{int(time.time())}.png")
             except Exception:
                 pass
-            b.close()
+            _close(b, is_cdp)
             _write_status("MANUAL", "找不到立即签到按钮")
             return "MANUAL"
 
@@ -906,7 +985,7 @@ def run_checkin():
             body_now = page.inner_text("body")
             if "今日已签" in body_now:
                 print("[main] 今日已签 (弹窗未起, 无需重复)", flush=True)
-                b.close()
+                _close(b, is_cdp)
                 _write_status("ALREADY", "今日已签(弹窗未起)")
                 return "ALREADY"
             else:
@@ -917,7 +996,7 @@ def run_checkin():
                     shutil.copy("/tmp/_ms_nonslide.png", f"F:/ai/_ms_nonslide_{int(time.time())}.png")
                 except Exception:
                     pass
-                b.close()
+                _close(b, is_cdp)
                 _write_status("MANUAL", "抽中非滑块型/无frame")
                 return "MANUAL"
 
@@ -971,7 +1050,7 @@ def run_checkin():
             status = "MANUAL"; detail = "抽中非滑块型(点击顺序), 滑块路线不适用"
         else:
             status = "MANUAL"; detail = "滑块多次尝试未成功(腾讯云风控拒绝 headless)"
-        b.close()
+        _close(b, is_cdp)
         _write_status(status, detail)
         return status
 
