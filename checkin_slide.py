@@ -36,6 +36,54 @@
   python3 checkin_slide.py --selftest # 只验证 cv2 缺口识别 + 轨迹生成 (无需登录)
 """
 import os, sys, time, math, random, argparse
+
+
+def _reexec_for_cv2():
+    """Alpine(musl) 上 cv2 装不到任意 python: opencv 在 PyPI 只有 manylinux(glibc) wheel,
+    没有任何 musllinux wheel; 唯一来源是 apk 的 py3-opencv, 而它编给【系统 python 3.12】.
+    cp312 的 .so 在 cp311 里加载不了(缺 config-3.11.py), 跨大版本也无法 .pth 桥接.
+    → 若当前解释器 import 不到 cv2, 就自动切到能 import 的解释器重跑, 无需手动改青龙任务命令."""
+    if os.environ.get("_MS_REEXEC") == "1":
+        return
+    try:
+        import cv2  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    cands, seen = [], set()
+    for d in ("/usr/bin", "/usr/local/bin", "/bin"):
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            p = os.path.join(d, f)
+            if not (f.startswith("python3") and os.path.isfile(p)):
+                continue
+            rp = os.path.realpath(p)
+            if rp in seen or rp == os.path.realpath(sys.executable):
+                continue
+            seen.add(rp)
+            cands.append(p)
+
+    full, partial = [], []
+    for p in cands:
+        if os.system('"%s" -c "import cv2" >/dev/null 2>&1' % p) != 0:
+            continue
+        partial.append(p)
+        if os.system('"%s" -c "import numpy, paramiko, playwright" >/dev/null 2>&1' % p) == 0:
+            full.append(p)
+
+    target = (full or partial or [None])[0]
+    if not target:
+        return
+    print("[reexec] 当前解释器 %s 无 cv2, 自动切换到 %s 重跑" % (sys.executable, target))
+    if target in partial and target not in full:
+        print("[reexec] 注意: %s 里还缺 numpy/paramiko/playwright, 请先跑 start_chrome_qinglong.sh" % target)
+    os.environ["_MS_REEXEC"] = "1"
+    os.execv(target, [target, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+_reexec_for_cv2()
 import numpy as np
 import cv2
 from playwright.sync_api import sync_playwright

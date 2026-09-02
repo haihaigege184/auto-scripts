@@ -33,21 +33,51 @@ elif command -v apk >/dev/null 2>&1; then
   done
 fi
 
-# cv2 兜底: apk 的 py3-opencv 装到了【另一个 python 前缀】(如 /usr/lib/python3.x),
-# 用 .pth 把那个 site-packages 桥接进任务实际用的 python(opencv 的 manylinux wheel 在 musl 装不上, 不能只靠 pip)
-if ! python3 -c "import cv2" >/dev/null 2>&1; then
-  CV2_DIR=$(find /usr /lib /opt /ql -maxdepth 7 -type d -name cv2 -path "*site-packages*" 2>/dev/null | head -1)
-  if [ -n "$CV2_DIR" ]; then
-    SP=$(python3 -c "import site;print(site.getsitepackages()[0])" 2>/dev/null)
-    SYS_SP=$(dirname "$CV2_DIR")
-    if [ -n "$SP" ] && [ "$SP" != "$SYS_SP" ]; then
-      echo "$SYS_SP" > "$SP/zz_cv2_bridge.pth" 2>/dev/null || true
-      echo "已桥接 cv2: $SYS_SP -> $SP"
-    fi
-  fi
+# ── cv2 的硬事实 (已核实, 别再绕路) ──────────────────────────────────
+#  1. opencv-python-headless 在 PyPI 上【只有 manylinux(glibc) wheel, 没有任何 musllinux wheel】
+#     → Alpine(musl) 上 pip 永远装不上 cv2.
+#  2. 唯一来源是 apk 的 py3-opencv, 而它编给【Alpine 系统 python 3.12】(/usr/lib/python3.12).
+#  3. cp312 的 .so 在 cp311 里加载不了(缺 config-3.11.py) → 【不能跨大版本 .pth 桥接】.
+# 结论: 只能把"任务实际用的解释器"切到有 cv2 的那个 python, 并把其余包装进同一个解释器.
+# 先清理上一版误建的桥接文件(它会让 3.11 去加载 3.12 的 cv2, 报难懂的 config 缺失错)
+find /usr /lib /opt /ql -maxdepth 8 \( -name "zz_cv2_bridge.pth" -o -name "zz_qinglong_sys.pth" \) \
+  -exec rm -f {} \; 2>/dev/null || true
+
+CV2_PY=""
+for PY in $(ls /usr/bin/python3* /usr/local/bin/python3* 2>/dev/null | sort -u); do
+  if "$PY" -c "import cv2" >/dev/null 2>&1; then CV2_PY="$PY"; break; fi
+done
+if [ -z "$CV2_PY" ]; then
+  echo "未找到能 import cv2 的解释器, 尝试 apk add py3-opencv ..."
+  apk add --no-cache py3-opencv 2>/dev/null || true
+  for PY in $(ls /usr/bin/python3* /usr/local/bin/python3* 2>/dev/null | sort -u); do
+    if "$PY" -c "import cv2" >/dev/null 2>&1; then CV2_PY="$PY"; break; fi
+  done
 fi
-python3 -c "import numpy, cv2, paramiko, playwright; print('依赖检查 OK: numpy/cv2/paramiko/playwright')" 2>&1 \
-  || echo "⚠️ 仍有依赖缺失(见上一行), 签到任务 import 会失败"
+
+if [ -n "$CV2_PY" ]; then
+  echo "带 cv2 的解释器: $CV2_PY ($($CV2_PY -c 'import sys;print(sys.version.split()[0])' 2>/dev/null))"
+  # 其余依赖装进【同一个】解释器, 保证 import 集合完整
+  for PKG in numpy paramiko playwright; do
+    "$CV2_PY" -m pip install --break-system-packages --no-cache-dir $PIPI "$PKG" \
+      >/tmp/cv2py_$PKG.log 2>&1 || echo "⚠️ $PKG 装进 $CV2_PY 失败(可忽略)"
+    tail -1 /tmp/cv2py_$PKG.log 2>/dev/null || true
+  done
+  "$CV2_PY" -c "import numpy, cv2, paramiko, playwright; print('依赖自检 OK ($CV2_PY): numpy/cv2/paramiko/playwright')" 2>&1 \
+    || echo "⚠️ $CV2_PY 仍有依赖缺失(见上一行)"
+  if [ "$CV2_PY" != "$(command -v python3)" ]; then
+    echo "──────────────────────────────────────────"
+    echo "⚠️ 任务默认解释器 $(command -v python3) 装不了 cv2 (无 musllinux wheel)"
+    echo "   checkin_slide.py 已内置自动切换, 无需改任务命令."
+    echo "   若要显式指定, 把签到任务命令改成:"
+    echo "   $CV2_PY /ql/data/scripts/haihaigege184_auto-scripts_main/checkin_slide.py"
+    echo "──────────────────────────────────────────"
+  fi
+else
+  echo "⚠️ 全容器找不到可用 cv2"
+fi
+python3 -c "import numpy, cv2, paramiko, playwright; print('默认解释器自检 OK: numpy/cv2/paramiko/playwright')" 2>&1 \
+  || echo "  (默认解释器无 cv2 属正常 → 签到时 checkin_slide.py 会自动切到上面的解释器)"
 
 echo "[2/3] 启动常驻 chromium (CDP :9222) ..."
 CHROME_BIN=$(command -v chromium || command -v chromium-browser \
