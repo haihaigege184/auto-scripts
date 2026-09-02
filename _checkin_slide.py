@@ -13,18 +13,21 @@
   - 回调: 腾讯云验证通过后回调 captchaTicket 给 1ms, 自动完成签到
   - 后续: 该 ticket 用于 1ms 的 /api/v1/mall/checkin (captchaTicket 字段)
 
-依赖 (已装): playwright + 系统真实 Chrome, cv2(opencv-python-headless), numpy, paramiko
+依赖: playwright (仅做 CDP 控制, 不起自动化浏览器), cv2(opencv-python-headless), numpy, paramiko
+      + 青龙容器内需装: chromium (或 google-chrome) + xvfb  (apt-get install -y xvfb chromium)
 运行环境: 必须用"真实浏览器环境"过天御 (headless playwright 被天御 100% 拒).
-  推荐: 宿主机常驻一个真 Chrome, 脚本经 CDP 接入:
-    xvfb-run -a google-chrome --remote-debugging-port=9222 \
-             --user-data-dir=/path/chrome-prof --no-first-run &
-    任务 env 设 CHROME_CDP_URL=http://127.0.0.1:9222
-  备选: 不设 CDP 时, 脚本自动用系统 Chrome (channel='chrome') headed 启动 + 持久 profile.
+  方案: 在【青龙容器内部】自起真实 chromium (经 xvfb 提供虚拟显示) -> 脚本用 CDP 接入,
+        完全无 playwright 自动化特征 (navigator.webdriver=undefined, 无 cdc_ 注入), 天御认不出是机器.
+        - 默认全程在 qinglong 容器内完成, 不涉及宿主机.
+        - 首次运行自动起 chromium 并常驻 (:9222), 后续运行复用同一 profile.
+        - 也可在青龙"依赖/启动"里预起 (见 start_chrome_qinglong.sh), 再设 CHROME_CDP_URL=http://127.0.0.1:9222.
   环境变量:
-    CHROME_CDP_URL      真实浏览器 DevTools 地址 (http://host:9222 或 ws://...), 优先
-    CHROME_PATH         显式 Chrome 可执行文件路径
-    CHROME_USER_DATA_DIR 持久 profile 目录 (累积真实使用痕迹, 更像真人)
-  兜底: 以上都不可用才回退 playwright headless (已知被天御拒, 仅本地调试).
+    CHROME_CDP_URL       已预起的真实浏览器 DevTools 地址 (可选; 不设则脚本自动在容器内起)
+    CHROME_BIN           chromium 可执行路径 (不设则自动 which)
+    CHROME_DEBUG_PORT    自起端口 (默认 9222)
+    CHROME_USER_DATA_DIR 持久 profile 目录 (默认 /ql/data/chrome_prof, 累积真实痕迹)
+  兜底: 容器内无 chromium 时才回退 playwright (已知被天御拒, 仅调试).
+  装依赖一键脚本: start_chrome_qinglong.sh (apt/apk 装 xvfb+chromium 并起常驻).
 
 用法:
   python3 _checkin_slide.py            # 端到端签到 (明天未签时跑)
@@ -786,79 +789,120 @@ def _write_status(status, detail=""):
         _ql_notify("1ms签到 A保底", f"自动化未过码, 需手动签到:\nhttps://1ms.run/user/checkin\n原因: {detail}")
 
 
-def _close(b, is_cdp):
-    """安全关闭: CDP 接入的真实浏览器只 disconnect (不 close, 否则会杀掉用户真浏览器)."""
-    if is_cdp:
-        try:
+def _close(b, is_cdp, proc=None):
+    """安全关闭: CDP 接入的真实浏览器只 disconnect (不 close, 否则会杀掉浏览器).
+    proc=None 表示浏览器非本脚本所起 (常驻), 同样只 disconnect 保留常驻.
+    """
+    try:
+        if is_cdp:
             b.disconnect()
-        except Exception:
-            pass
+        else:
+            b.close()
+    except Exception:
+        pass
+
+
+def _spawn_real_chrome(p):
+    """在【青龙容器内部】自行启动真实 chromium (需 apt/apk 装 xvfb+chromium), 经 xvfb 提供虚拟显示,
+    再用 CDP 接入 -> 完全无 playwright 自动化特征 (navigator.webdriver=undefined, 无 cdc_ 注入),
+    天御认不出是机器. 这是"青龙环境内浏览器环境"的核心实现, 不涉及宿主机.
+
+    返回 (browser, True, proc) 或 None; proc 为自起的子进程 (默认常驻复用, 不主动 kill).
+    """
+    import subprocess, shutil, urllib.request
+    port = int(os.environ.get("CHROME_DEBUG_PORT", "9222"))
+    ver_url = f"http://127.0.0.1:{port}/json/version"
+    # 1) 端口已活着 (上次自起的 chromium 仍在) -> 直接接入复用 (保持 profile 与常驻)
+    try:
+        with urllib.request.urlopen(ver_url, timeout=2) as r:
+            if r.status == 200:
+                print(f"[browser] 复用容器内已常驻的 chromium :{port}", flush=True)
+                return p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}"), True, None
+    except Exception:
+        pass
+    # 2) 找二进制 (青龙容器内 apt 装的 chromium / google-chrome)
+    binpath = (os.environ.get("CHROME_BIN") or shutil.which("chromium") or
+               shutil.which("chromium-browser") or shutil.which("google-chrome") or
+               shutil.which("google-chrome-stable"))
+    if not binpath:
+        return None
+    ud = os.environ.get("CHROME_USER_DATA_DIR", "/ql/data/chrome_prof")
+    try:
+        os.makedirs(ud, exist_ok=True)
+    except Exception:
+        pass
+    cmd = [binpath, f"--remote-debugging-port={port}", "--no-sandbox",
+           "--disable-dev-shm-usage", f"--user-data-dir={ud}",
+           "--no-first-run", "--no-default-browser-check", "--disable-extensions"]
+    # 无 DISPLAY 时用 xvfb-run 包一层 (headed 真实浏览器); 否则直接 headed
+    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
+        cmd = ["xvfb-run", "-a"] + cmd
+        print(f"[browser] 容器内无 DISPLAY, 用 xvfb 包真实 chromium ...", flush=True)
     else:
+        print(f"[browser] 容器内有 DISPLAY, 直接 headed 启动真实 chromium ...", flush=True)
+    print(f"[browser] 自起: {binpath} (CDP :{port}, prof={ud})", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 3) 等端口就绪
+    for _ in range(60):
         try:
-            _close(b, is_cdp)
+            with urllib.request.urlopen(ver_url, timeout=1) as r:
+                if r.status == 200:
+                    b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                    print(f"[browser] ✅ 容器内 chromium 就绪 (CDP {port})", flush=True)
+                    return b, True, proc
         except Exception:
-            pass
+            time.sleep(0.5)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    return None
 
 
 def launch_browser(p):
-    """'浏览器环境'方案启动/接入真实浏览器, 绕过天御对 headless playwright 的 100% 拒绝.
+    """'浏览器环境'方案: 在【青龙容器内部】启动/接入真实浏览器, 绕过天御对 headless playwright 的 100% 拒绝.
 
     天御风险引擎靠 navigator.webdriver / cdc_ 注入 / 无头标记 / 缺 plugins·WebGL 等判 bot.
-    真实浏览器(用户自己开的 Chrome)这些特征都是"真人", 且 playwright 的自动化注入只发生在
-    launch() 时; 用 connect_over_cdp 接入的浏览器没有任何 playwright 痕迹.
+    用 subprocess 起真正的 chromium (而非 playwright.launch) + 经 CDP 接入 -> 零 playwright 痕迹,
+    这些特征都是"真人".
 
     优先级:
       1) CHROME_CDP_URL 已设 (http://127.0.0.1:9222 或 ws://...) ->
-         connect_over_cdp 接入用户已开的真浏览器 (最稳, 零自动化特征)
-         部署: 宿主机 `xvfb-run -a google-chrome --remote-debugging-port=9222
-                --user-data-dir=/path/prof --no-first-run &`, 任务 env 设 CHROME_CDP_URL
-      2) 否则用系统真实 Chrome (channel='chrome' 或 CHROME_PATH) headed 启动 + 持久 user-data-dir
-         (需宿主机有显示器; 服务器用 xvfb-run 包一层)
-      3) 兜底: playwright 自带 chromium headless (原行为, 已知被天御拒, 仅本地调试)
-    返回 (browser, is_cdp)
+         connect_over_cdp 接入 (通常配合 start_chrome_qinglong.sh 预起常驻 chromium)
+      2) 否则在【青龙容器内】自行启动真实 chromium (需装 xvfb+chromium), 经 CDP 接入
+         —— 完全在 qinglong 容器内完成, 不涉及宿主机
+      3) 兜底: playwright 自带 chromium (headed -> 仍带 playwright 特征; 再不行 headless),
+         已知被天御拒, 仅本地调试
+    返回 (browser, is_cdp, proc)
     """
     cdp = os.environ.get("CHROME_CDP_URL") or os.environ.get("BROWSER_CDP_WS")
     if cdp:
         try:
             print(f"[browser] 通过 CDP 接入真实浏览器: {cdp}", flush=True)
-            return p.chromium.connect_over_cdp(cdp), True
+            return p.chromium.connect_over_cdp(cdp), True, None
         except Exception as e:
-            print(f"[browser] CDP 接入失败, 回退启动真实 Chrome: {e}", flush=True)
+            print(f"[browser] CDP 接入失败 ({e}), 改容器内自起 chromium", flush=True)
 
-    # 系统真实 Chrome (headed)
-    kw = dict(
-        headless=False,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    )
-    ud = os.environ.get("CHROME_USER_DATA_DIR")
-    if ud:
-        kw["user_data_dir"] = ud
-    ch = os.environ.get("CHROME_PATH")
-    if ch:
-        kw["executable_path"] = ch
-    else:
-        try:
-            kw["channel"] = "chrome"
-        except Exception:
-            pass
+    # 青龙容器内自起真实 chromium (需装 xvfb+chromium), 经 CDP 接入 -> 零 playwright 特征
+    r = _spawn_real_chrome(p)
+    if r:
+        return r
+
+    # 兜底: 容器内无 chromium 时才回退 playwright (已知被天御拒, 仅调试)
+    print("[browser] ⚠️ 容器内未找到真实 chromium, 回退 playwright (可能被天御拒)", flush=True)
     try:
-        print("[browser] 启动系统真实 Chrome (headed) ...", flush=True)
-        return p.chromium.launch(**kw), False
-    except Exception as e:
-        print(f"[browser] 真实 Chrome 启动失败 ({e}), 回退 playwright headless", flush=True)
+        return p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                  "--disable-dev-shm-usage", "--no-sandbox"],
+        ), False, None
+    except Exception:
         return p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-web-security",
-            ],
-        ), False
+            args=["--disable-blink-features=AutomationControlled",
+                  "--disable-features=IsolateOrigins,site-per-process",
+                  "--disable-web-security"],
+        ), False, None
 
 
 def run_checkin():
@@ -868,7 +912,7 @@ def run_checkin():
 
     with sync_playwright() as p:
         # '浏览器环境'方案: 优先接入/启动真实浏览器 (见 launch_browser), 不再用 playwright headless
-        b, is_cdp = launch_browser(p)
+        b, is_cdp, proc = launch_browser(p)
         # 真实浏览器(CDP)用其默认 context; 自启动的建新 context + viewport
         if is_cdp and b.contexts:
             ctx = b.contexts[0]
