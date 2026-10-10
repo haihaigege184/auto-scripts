@@ -1,0 +1,17 @@
+[Unit]
+Description=EasyFrp Captcha OCR Service (ddddocr)
+Documentation=file:///opt/ef_ocr_service.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ocrvenv/bin/python -u /opt/ef_ocr_service.py --host 0.0.0.0 --port 13003
+WorkingDirectory=/opt
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/ef_ocr.log
+StandardError=append:/var/log/ef_ocr.log
+# 青龙容器经 docker0 网关 172.17.0.1 访问本服务
+[Install]
+WantedBy=multi-user.target

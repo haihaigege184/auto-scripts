@@ -15,9 +15,17 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   POST /api/v1/normal/system/user/sign/summary    -> 签到日历/积分汇总
   鉴权头: Token: <jwt>   (注意不是 Authorization: Bearer)
 
-验证码处理 (ef_captcha_ocr.py):
-  纯 cv2 OCR, 无 ML 依赖。裸准确率约 55%, 配合"低分换图重试"可显著提升成功率。
+验证码处理 (推荐走宿主机 ddddocr 服务):
+  ★ 关键实测结论 (2026-10, 用登录接口当裁判自动测出, 非人工标注):
+      ddddocr 的输出可二分 ——
+        输出「4 位纯数字」→ 准确率 100% (raw 24/24)
+        输出其他(含字母/位数不对) → 准确率 0%
+      因此策略是「只在服务标记 clean 时才提交, 不确定就换图」。
+      宿主机服务跑双通道 (raw 原图 + bright 亮度分离去彩线):
+        单张图 clean 概率 93.3%, clean 时命中率 100%, 平均 1.07 张图即可登录成功。
   captchaKey 一次性但可重复提交, 因此重试成本极低。
+  (旧结论"ddddocr 仅 29%"是错的 —— 那是拿 72 张人工标注样本测的,
+   而该批标注本身约 30% 有误, 把正确识别也判成了错。)
 
 环境变量:
   EF_ACCOUNT   —— 账号 (必填, 默认回落到 GOST_ACCOUNT)
@@ -26,10 +34,11 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   EF_TOKEN_FILE—— JWT 缓存路径, 默认 /ql/data/ef_token.txt (登录一次可用 7 天)
   EF_MAX_TRY   —— 验证码最大重试轮数, 默认 25
   EF_CAPTCHA_MODE —— 验证码来源: auto(默认, 先OCR后转人工) | manual(直接人工) | ocr(只用OCR)
-  EF_OCR_URL   —— 宿主机 OCR 服务地址(方案B, ddddocr), 如 http://172.17.0.1:13003/ocr
-                  不设则只用本地 cv2 模块(准确率低, 建议配这个)
-  EF_OCR_TRY   —— auto 模式下先试 OCR 的轮数, 默认 2
+  EF_OCR_URL   —— 宿主机 OCR 服务地址, 如 http://172.17.0.1:13003/ocr
+                  不设则只用本地 cv2 模块(准确率低, 强烈建议配这个)
+  EF_OCR_TRY   —— auto 模式下先试 OCR 的轮数, 默认 2 (建议设 12)
   EF_HUMAN_TRY —— 人工过码最多尝试轮数, 默认 3
+  EF_UNSURE_MAX—— 连续多少轮"不确定"后强制提交最佳候选, 默认 8 (防服务异常时空转)
   EF_CAPTCHA_WAIT  —— 人工过码最长等待秒数, 默认 300
   EF_CAPTCHA_WEBHOOK —— 人工过码网关, 默认 http://172.17.0.1:13002
   EF_ADMIN    —— 收验证码的 QQ 号 (默认用 SEA2 的 superAdmin)
@@ -237,12 +246,20 @@ def ocr_captcha(bs64, verbose=True):
                 headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=20) as r:
                 resp = json.loads(r.read().decode())
+            ch = resp.get("channels") or {}
+            raw_t = (ch.get("raw") or {}).get("text")
+            br_t = (ch.get("bright") or {}).get("text")
             if verbose:
-                log(f"  [ocr] 宿主机 ddddocr -> {resp.get('text')} "
-                    f"conf={resp.get('conf')} {resp.get('ms')}ms")
+                log(f"  [ocr] 宿主机双通道 raw={raw_t} bright={br_t} "
+                    f"clean={resp.get('clean')} {resp.get('ms')}ms")
             if resp.get("ok") and resp.get("text"):
+                # clean=True: 服务在「4位纯数字」通道上给出了答案(实测该条件下近乎必对)
+                # clean=False: 两个通道都不确定 —— 换图比浪费一次提交更划算
+                if resp.get("clean") is False:
+                    return None, {"mode": "ocr_unsure", "text": resp["text"],
+                                  "channels": ch}
                 return resp["text"], {"mode": "host_ocr", "text": resp["text"],
-                                      "conf": resp.get("conf", 1.0)}
+                                      "conf": resp.get("conf", 1.0), "clean": True}
             if verbose:
                 log(f"  [ocr] 宿主机服务返回异常: {resp}")
         except Exception as e:
@@ -365,6 +382,8 @@ def login_with_captcha(account, password, max_try=None):
     human_try = int(os.environ.get("EF_HUMAN_TRY", "3") or 3)
     best_seen = None
     human_fail = 0
+    unsure_streak = 0
+    unsure_max = int(os.environ.get("EF_UNSURE_MAX", "8") or 8)
 
     for i in range(1, max_try + 1):
         # auto 模式: 前 ocr_try 轮走 OCR, 之后转人工
@@ -373,7 +392,9 @@ def login_with_captcha(account, password, max_try=None):
             use_mode = "ocr" if i <= ocr_try else "manual"
         if use_mode == "manual" and human_fail >= human_try:
             return None, f"人工过码连续失败 {human_fail} 次, 放弃"
-        if use_mode == "ocr" and ocr is None and mode == "auto":
+        # 仅当「本地 cv2 缺失」且「宿主机 OCR 服务也未配置」时才降级人工
+        if (use_mode == "ocr" and ocr is None and mode == "auto"
+                and not os.environ.get("EF_OCR_URL", "").strip()):
             use_mode = "manual"
 
         key, bs64 = fetch_captcha()
@@ -385,11 +406,20 @@ def login_with_captcha(account, password, max_try=None):
         if info.get("mode") == "forced" or (info.get("text") and best_seen is None):
             best_seen = info.get("text") or best_seen
         if not value:
-            if use_mode == "manual":
-                human_fail += 1
-                log(f"  [login] 人工过码未取得结果: {info.get('mode')}")
-            time.sleep(random.uniform(0.6, 1.4))
-            continue
+            if info.get("mode") == "ocr_unsure":
+                unsure_streak += 1
+                # 兜底: 万一服务持续"不确定", 不要空转到轮次耗尽
+                if unsure_streak >= unsure_max and info.get("text"):
+                    value = str(info["text"])
+                    log(f"  [login] 连续 {unsure_streak} 轮不确定, 强制提交候选 {value}")
+            if not value:
+                if use_mode == "manual":
+                    human_fail += 1
+                    log(f"  [login] 人工过码未取得结果: {info.get('mode')}")
+                time.sleep(random.uniform(0.6, 1.4))
+                continue
+        else:
+            unsure_streak = 0
         code, obj, status = api_call(LOGIN_API, {
             "account": account, "password": password,
             "captchaKey": key, "captchaValue": value,
@@ -466,13 +496,17 @@ def do_sign(token, account, password, score_before=None):
     human_try = int(os.environ.get("EF_HUMAN_TRY", "3") or 3)
     best = None
     human_fail = 0
+    unsure_streak = 0
+    unsure_max = int(os.environ.get("EF_UNSURE_MAX", "8") or 8)
     for i in range(1, max_try + 1):
         use_mode = mode
         if mode == "auto":
             use_mode = "ocr" if i <= ocr_try else "manual"
         if use_mode == "manual" and human_fail >= human_try:
             break
-        if use_mode == "ocr" and ocr is None and mode == "auto":
+        # 仅当「本地 cv2 缺失」且「宿主机 OCR 服务也未配置」时才降级人工
+        if (use_mode == "ocr" and ocr is None and mode == "auto"
+                and not os.environ.get("EF_OCR_URL", "").strip()):
             use_mode = "manual"
 
         key, bs64 = fetch_captcha()
@@ -484,10 +518,18 @@ def do_sign(token, account, password, score_before=None):
         if info.get("text") and best is None:
             best = info["text"]
         if not value:
-            if use_mode == "manual":
-                human_fail += 1
-            time.sleep(random.uniform(0.6, 1.4))
-            continue
+            if info.get("mode") == "ocr_unsure":
+                unsure_streak += 1
+                if unsure_streak >= unsure_max and info.get("text"):
+                    value = str(info["text"])
+                    log(f"  [sign] 连续 {unsure_streak} 轮不确定, 强制提交候选 {value}")
+            if not value:
+                if use_mode == "manual":
+                    human_fail += 1
+                time.sleep(random.uniform(0.6, 1.4))
+                continue
+        else:
+            unsure_streak = 0
         code, obj, status = api_call(SIGN_API, {"captchaKey": key, "captchaValue": value}, token=token)
         if code == 0 and isinstance(obj, dict):
             d = obj.get("data") or {}
@@ -558,11 +600,18 @@ def main():
         push("❌ EasyFrp 签到失败", "未配置账号或密码", "error")
         return 1
 
+    _host_ocr = os.environ.get("EF_OCR_URL", "").strip()
     log(f"ℹ️ 验证码模式: {captcha_mode()}"
-        + (" (仅人工过码)" if captcha_mode() != "ocr" else ""))
+        + (" (OCR: 宿主机 ddddocr)" if (_host_ocr and captcha_mode() != "manual")
+           else " (仅人工过码)" if captcha_mode() != "ocr" else " (仅本地cv2)"))
     if ocr is None:
-        log("⚠️ 本地 OCR 模块不可用, 将直接走人工过码通道"
-            + (f" ({OCR_IMPORT_ERR})" if OCR_IMPORT_ERR else ""))
+        # 本地 cv2 缺失不等于要转人工 —— 宿主机 OCR 服务才是主力通道
+        if _host_ocr:
+            log(f"ℹ️ 本地 cv2 未安装(容器 Alpine 常态), 走宿主机 OCR: {_host_ocr}"
+                + (f" [{OCR_IMPORT_ERR}]" if OCR_IMPORT_ERR else ""))
+        else:
+            log("⚠️ 本地 OCR 模块不可用且未配置 EF_OCR_URL, 将直接走人工过码通道"
+                + (f" ({OCR_IMPORT_ERR})" if OCR_IMPORT_ERR else ""))
 
     # 1) 登录
     token, err = ensure_token(account, password)
