@@ -40,7 +40,8 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   EF_HUMAN_TRY —— 人工过码最多尝试轮数, 默认 3
   EF_UNSURE_MAX—— 连续多少轮"不确定"后强制提交最佳候选, 默认 8 (防服务异常时空转)
   EF_CAPTCHA_WAIT  —— 人工过码最长等待秒数, 默认 300
-  EF_CAPTCHA_WEBHOOK —— 人工过码网关, 默认 http://172.17.0.1:13002
+  EF_CAPTCHA_WEBHOOK —— 人工过码网关, 默认 http://172.17.0.1:13004
+                  (SEA2 插件 plugins/easyfrp; 13002 是 ql-notify, 只做通知不过码)
   EF_ADMIN    —— 收验证码的 QQ 号 (默认用 SEA2 的 superAdmin)
   EF_CAPTCHA_VALUE —— 直接指定验证码值 (调试用, 优先级最高)
 
@@ -314,14 +315,15 @@ def save_captcha_png(bs64, path):
 
 # -------- 人工过码: 通过 SEA2 插件把图片推 QQ, 人工回复数字后轮询取回 --------
 def _webhook_base():
+    # 过码通道已从 ql-notify(13002) 拆到独立插件 plugins/easyfrp(13004)
     return (os.environ.get("EF_CAPTCHA_WEBHOOK", "").strip()
-            or "http://172.17.0.1:13002").rstrip("/")
+            or "http://172.17.0.1:13004").rstrip("/")
 
 
 def _ask_human(bs64, task):
     """把验证码推到 QQ, 阻塞轮询等待人工回复。返回 (value, err)。
 
-    协议 (SEA2 ql-notify 插件 3.2.0):
+    协议 (SEA2 easyfrp 插件 / 原 ql-notify 3.2.0 拆分而来):
       POST {base}/webhook/captcha  {imageBase64, task, admin?} -> {ok, challengeId}
       GET  {base}/webhook/captcha/result?id=<challengeId>    -> {status: pending|answered, answer}
     插件侧 challenge TTL 10 分钟, 这里默认等 300 秒, 超时即放弃本轮。

@@ -15,10 +15,14 @@
 
 用户只需在 QQ 私聊里**直接回复 4 位数字**，全程无需守在电脑前。
 
-### 实现（SEA2 `ql-notify` 插件 3.2.0）
+### 实现（SEA2 独立插件 `easyfrp`，端口 13004）
+
+> 2026-10-11 拆分：过码能力原先寄生在 `ql-notify`(13002) 里，但该插件的定位是「青龙通知」，
+> 名实不符。现按用户要求拆为独立插件 **`plugins/easyfrp`（13004）**，
+> `ql-notify` 回归纯通知（只保留 `POST /webhook/ql`），两边行为逐行不变。
 
 ```
-青龙脚本                SEA2 插件 (13002)              QQ
+青龙脚本           SEA2 插件 easyfrp (13004)        QQ
   │ POST /webhook/captcha        │                        │
   │ {imageBase64, task} ───────> │ adapter.send(admin,    │
   │                              │ b64, {type:'image'}) ─>│ 图片送达
@@ -31,9 +35,17 @@
 
 - **协议**：`POST /webhook/captcha` → `{ok, challengeId}`；`GET /webhook/captcha/result?id=` → `{status, answer}`
 - **安全**：仅私聊 + 仅 challenge 指定管理员（superAdmin）+ 4位数字正则 + 随机 id + 10 分钟 TTL
-- **诊断**：`GET /webhook/captcha/pending` 查看未过期 challenge 概况
+- **诊断**：`GET /webhook/captcha/pending` 查看未过期 challenge 概况；`GET /health` 看插件状态
+- **主动发起**：QQ 私聊发「过码 / 签到 / 补签 / gostc / easyfrp」→ 插件经青龙 API `PUT /api/crons/run` 触发任务 659
 - 关键 API：`adapter.send(uin, base64, {type:'image'})` 发图片；`onMessage` 里 `context.userId` / `context.groupId` / `context.reply`
 - SEA2 由 pm2 管理，改插件后 `pm2 restart sea2-bot`；重启后需等 NapCat 重新连入（约 1-2 分钟）才能发图
+- ⚠️ 命令判定必须先于「4 位数字=答案」判定，否则命令里带的数字会被误当成验证码答案
+
+### 通知通道（SEA2 插件 `ql-notify`，端口 13002）
+
+青龙脚本结果推送走 `MS_WEBHOOK_URL=http://172.17.0.1:13002/webhook/ql` → 插件私发管理员
+（payload 可带 `group` 同时推群、带 `admin` 覆盖收件人）。`env.sh` 必须配这一项，
+否则脚本只打印「无可用推送渠道, 仅本地日志」。
 
 ### 验证码模式（`EF_CAPTCHA_MODE`）
 
@@ -43,7 +55,7 @@
 | `manual` | 直接人工过码 |
 | `ocr` | 只用 OCR |
 
-其他参数：`EF_CAPTCHA_WAIT`（等待秒数，默认 300）、`EF_HUMAN_TRY`、`EF_OCR_TRY`、`EF_ADMIN`、`EF_CAPTCHA_WEBHOOK`（默认 `http://172.17.0.1:13002`）
+其他参数：`EF_CAPTCHA_WAIT`（等待秒数，默认 300）、`EF_HUMAN_TRY`、`EF_OCR_TRY`、`EF_ADMIN`、`EF_CAPTCHA_WEBHOOK`（默认 `http://172.17.0.1:13004`，指向 easyfrp 插件）
 
 ## 接口对照
 
