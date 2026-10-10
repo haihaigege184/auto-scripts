@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""EasyFrp 验证码 OCR 服务（宿主机侧）
+"""[已迁移] EasyFrp 验证码 OCR 服务 —— 宿主机侧快照
 
-为什么在宿主机跑:
+⚠️ 2026-10-11 起本服务已**容器化部署**，本文件仅作历史快照。
+   最新代码与镜像:
+     仓库  https://github.com/haihaigege184/easyfrp-ocr
+     镜像  ghcr.io/haihaigege184/easyfrp-ocr:latest
+     运行  docker run -d --name ef-ocr --restart unless-stopped -p 13003:13003 \
+             ghcr.io/haihaigege184/easyfrp-ocr:latest
+   改动请改新仓库，避免两份代码漂移。
+
+为什么当初在宿主机跑:
   青龙容器是 Alpine musl，`onnxruntime` 没有二进制 wheel，ddddocr 装不上。
   宿主机 Debian + Python 3.11 有 wheel，于是把"重活"放宿主机，容器只做 HTTP 调用。
+  （容器化后这个限制被封进镜像，宿主机不再需要 venv。）
 
 核心策略（实测结论，非常重要）:
   ddddocr 的输出可二分：
@@ -25,8 +34,9 @@
            "ms":123, "bytes":6081}
   GET  /health -> {"ok":true,"engine":"ddddocr",...}
 
-部署（宿主机 10.0.0.11）:
-  systemctl enable --now ef-ocr     # unit 见 /etc/systemd/system/ef-ocr.service
+部署（容器化，见 https://github.com/haihaigege184/easyfrp-ocr）:
+  docker run -d --name ef-ocr --restart unless-stopped -p 13003:13003 \
+    ghcr.io/haihaigege184/easyfrp-ocr:latest
 青龙容器调用:
   EF_OCR_URL=http://172.17.0.1:13003/ocr
 """

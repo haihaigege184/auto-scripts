@@ -15,7 +15,7 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   POST /api/v1/normal/system/user/sign/summary    -> 签到日历/积分汇总
   鉴权头: Token: <jwt>   (注意不是 Authorization: Bearer)
 
-验证码处理 (推荐走宿主机 ddddocr 服务):
+验证码处理 (推荐走 ddddocr 容器服务, 仓库 haihaigege184/easyfrp-ocr):
   ★ 关键实测结论 (2026-10, 用登录接口当裁判自动测出, 非人工标注):
       ddddocr 的输出可二分 ——
         输出「4 位纯数字」→ 准确率 100% (raw 24/24)
@@ -34,7 +34,7 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   EF_TOKEN_FILE—— JWT 缓存路径, 默认 /ql/data/ef_token.txt (登录一次可用 7 天)
   EF_MAX_TRY   —— 验证码最大重试轮数, 默认 25
   EF_CAPTCHA_MODE —— 验证码来源: auto(默认, 先OCR后转人工) | manual(直接人工) | ocr(只用OCR)
-  EF_OCR_URL   —— 宿主机 OCR 服务地址, 如 http://172.17.0.1:13003/ocr
+  EF_OCR_URL   —— OCR 服务地址(容器), 如 http://172.17.0.1:13003/ocr
                   不设则只用本地 cv2 模块(准确率低, 强烈建议配这个)
   EF_OCR_TRY   —— auto 模式下先试 OCR 的轮数, 默认 2 (建议设 12)
   EF_HUMAN_TRY —— 人工过码最多尝试轮数, 默认 3

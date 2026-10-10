@@ -1,5 +1,13 @@
+# ⚠️ DEPRECATED (2026-10-11) —— 已改用容器化部署，本 unit 停止使用
+#   新方案（推荐）:
+#     docker run -d --name ef-ocr --restart unless-stopped -p 13003:13003 \
+#       ghcr.io/haihaigege184/easyfrp-ocr:latest
+#   源码仓库: https://github.com/haihaigege184/easyfrp-ocr
+#   本文件仅作回滚备份，勿再 systemctl enable。
+#   若确需回滚: systemctl enable --now ef-ocr
+#
 [Unit]
-Description=EasyFrp Captcha OCR Service (ddddocr)
+Description=EasyFrp Captcha OCR Service (ddddocr) [DEPRECATED]
 Documentation=file:///opt/ef_ocr_service.py
 After=network-online.target
 Wants=network-online.target
@@ -13,5 +21,6 @@ RestartSec=3
 StandardOutput=append:/var/log/ef_ocr.log
 StandardError=append:/var/log/ef_ocr.log
 # 青龙容器经 docker0 网关 172.17.0.1 访问本服务
+
 [Install]
 WantedBy=multi-user.target

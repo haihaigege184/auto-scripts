@@ -198,8 +198,11 @@ EasyFrp 的参数组合（120×40 小尺寸 + 4 位 + 浅色细线 + 深色粗�
 
 ### 落地实现与端到端实测
 
-**1) 宿主机双通道 OCR 服务** `ef_ocr_service.py`
-（systemd 常驻 `ef-ocr.service`，监听 `0.0.0.0:13003`，容器经 docker0 网关 `172.17.0.1` 访问）
+**1) 双通道 OCR 服务**（**已容器化**）
+- 镜像 `ghcr.io/haihaigege184/easyfrp-ocr:latest`（公开，匿名可拉）
+- 源码仓库 https://github.com/haihaigege184/easyfrp-ocr
+- 监听 `0.0.0.0:13003`，青龙容器经 docker0 网关 `172.17.0.1:13003` 访问
+- 原先的 `systemd ef-ocr`（裸跑 `/opt/ocrvenv`）**已停用**，见下方「部署速查」
 
 - 通道 1 `raw`：原图直送 ddddocr
 - 通道 2 `bright`：亮度门限 `lum < 130` 去掉彩色干扰线后再送（干扰线普遍比字符亮）
@@ -233,20 +236,28 @@ export EF_UNSURE_MAX=8
 12 轮 OCR 全失败概率 ≈ `0.07^12 ≈ 1e-14` → **人工过码仅作理论兜底，实际不会触发**
 （人工过码通道保留且可用：QQ 推图 + 回复数字，见上文）。
 
-**部署速查**
+**部署速查（2026-10-11 起改为容器化）**
 ```bash
-# 宿主机
-systemctl enable --now ef-ocr                  # unit 见 scripts/gost/ef-ocr.service
+# 宿主机：容器常驻（restart unless-stopped 等效开机自启）
+docker run -d --name ef-ocr --restart unless-stopped -p 13003:13003 \
+  ghcr.io/haihaigege184/easyfrp-ocr:latest
 curl -s http://127.0.0.1:13003/health          # 期望 {"ok":true,"channels":["raw","bright"]}
 # 容器内连通性自测
 docker exec ql1 sh -c "curl -s http://172.17.0.1:13003/health"
+# 更新镜像
+docker pull ghcr.io/haihaigege184/easyfrp-ocr:latest && docker rm -f ef-ocr && \
+  docker run -d --name ef-ocr --restart unless-stopped -p 13003:13003 \
+  ghcr.io/haihaigege184/easyfrp-ocr:latest
+# 回滚到旧 systemd 方式（不推荐）
+# systemctl enable --now ef-ocr
 # 评估工具：用服务端 oracle 测准确率，无需人工标注
 /opt/ocrvenv/bin/python /root/ef_eval_ocr.py 30
 ```
 
 ### 保留资产
-- `ef_ocr_service.py`：宿主机 OCR 服务（**当前生产在用**，systemd `ef-ocr`）
-- `ef-ocr.service`：systemd unit（已入库）
+- `ef_ocr_service.py` / `ef-ocr.service`：**已迁移为容器化部署**，仅作历史记录。
+  ⚠️ 最新代码在 https://github.com/haihaigege184/easyfrp-ocr，
+  **改动请改新仓库**（本目录两份是快照，避免两份代码漂移）
 - `ef_samples/` 72 张图 —— **标注不可信（约 30% 有误）**，仅作看图参考，**勿用于评估**
 - `ef_digit_font.json` / `templates_ef.npz` / `ef_captcha_ocr.py` —— 自研 cv2 路线（线上 0%），
   已被 ddddocr 双通道方案取代，保留仅作记录
