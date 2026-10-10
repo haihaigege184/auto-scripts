@@ -16,6 +16,9 @@ __pycache__/
 *.png
 *.jpg
 
+# 例外: EasyFrp 验证码标注样本是已标注数据集, 必须入库(后续 ML 方案要复用)
+!scripts/gost/ef_samples/*.jpg
+
 # 系统
 .DS_Store
 Thumbs.db
