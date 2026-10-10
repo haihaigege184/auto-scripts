@@ -595,7 +595,16 @@ def main():
     else:
         title, level = "⚠️ EasyFrp 签到未完成", "error"
 
-    content = f"账号 {account}\n{detail}"
+    # 推送正文: 账号 / 本次结果 / 当前积分余额 / 累计签到积分
+    lines = [f"账号 {account}", detail]
+    wallet = (info2 or {}).get("wallet") or {}
+    cur_score = wallet.get("score")
+    if cur_score is not None:
+        lines.append(f"当前积分余额 {cur_score}")
+    sign_total = _sign_score(info2) if info2 else None
+    if sign_total is not None:
+        lines.append(f"累计签到积分 {sign_total}")
+    content = "\n".join(lines)
     if summary:
         content += f"\n{json.dumps(summary, ensure_ascii=False)[:200]}"
     log("📤 " + title)

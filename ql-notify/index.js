@@ -26,6 +26,19 @@
  *   - 安全性：只有 superAdmin / payload.admin 的消息才会被当作答案；
  *     challenge 带随机 id + 过期时间，过期即失效，不会被无关消息误配。
  *
+ * 3.2.1 扩展（2026-10-10，主动发起人工过码）：
+ *   - 管理员在 QQ 私聊发「过码 / 签到 / 补签 / gostc / easyfrp」→ 立即触发青龙签到任务，
+ *     验证码图片随后照常推送到 QQ，等管理员回复。
+ *   - 解决"定时任务推送验证码时人不在，回执过期"的问题：想签的时候随时手动打一发。
+ *   - 实现走青龙自身 API（PUT /api/crons/run），token 从容器 auth.json 读
+ *     （/root/ql1 已 bind mount 到容器 /ql/data）。不另建执行通道，避免两套调度打架。
+ *   - ⚠️ 格式坑(实测): /api/crons/run 的 body 是【裸数组】 [659]；
+ *     {"ids":[659]} 会 400("value must be an array")。
+ *     而 /api/crons/disable|enable 才收 {"ids":[...]}。两者不一样，别混用。
+ *   - 环境变量 EF_SIGN_TASK_ID（默认 659）、QL_API_BASE（默认 http://127.0.0.1:5701）、
+ *     QL_AUTH_JSON（默认 /root/ql1/config/auth.json）
+ *   - ⚠️ 命令判定必须在"4位数字=验证码答案"之前，否则命令里带的数字会被误当成答案。
+ *
  * 3.1.15 扩展（2026-09-15，宝宝在哪控制台加「推送管理员 QQ」）：
  *   - webhook payload 支持可选 "admin": "<QQ号>" 字段——带该字段时本次私发目标改为它，
  *     覆盖 config.superAdmin 默认值（控制台改完即时生效，不必去改框架配置）。
@@ -61,6 +74,7 @@
 const BasePlugin = require('../base-plugin');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;   // challenge 最长存活 10 分钟
 const CAPTCHA_HINT = '请直接回复这 4 位数字（私聊即可，不必加指令）';
@@ -283,6 +297,104 @@ class QlNotifyPlugin extends BasePlugin {
         }));
     }
 
+    // ==================== 主动发起人工过码（QQ 命令） ====================
+
+    /**
+     * 触发青龙任务立即执行。
+     * 走青龙自身 API（PUT /api/crons/run），token 从容器 auth.json 读
+     * （/root/ql1 已 bind mount 到容器 /ql/data，宿主机可直接读）。
+     * 这样不需要在插件里另建一套执行通道，也不会有"两套调度打架"的问题。
+     */
+    async _runCrontask(taskId) {
+        const id = parseInt(taskId, 10);
+        if (!id) return { ok: false, error: 'bad taskId' };
+        const authPath = process.env.QL_AUTH_JSON || '/root/ql1/config/auth.json';
+        const base = process.env.QL_API_BASE || 'http://127.0.0.1:5701';
+        let token = '';
+        try {
+            token = JSON.parse(fs.readFileSync(authPath, 'utf8')).token || '';
+        } catch (e) {
+            return { ok: false, error: `读取 ${authPath} 失败: ${e.message}` };
+        }
+        if (!token) return { ok: false, error: 'auth.json 里没有 token' };
+
+        // node 18+ 有全局 fetch；老版本退回 http 模块
+        const doPut = async (url, bodyStr) => {
+            if (typeof fetch === 'function') {
+                const r = await fetch(url, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer ' + token,
+                    },
+                    body: bodyStr,
+                });
+                return { status: r.status, text: await r.text() };
+            }
+            return new Promise((resolve, reject) => {
+                const u = new URL(url);
+                const req = http.request({
+                    hostname: u.hostname, port: u.port || 80, path: u.pathname,
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(bodyStr),
+                        Authorization: 'Bearer ' + token,
+                    },
+                }, (r2) => {
+                    let b = '';
+                    r2.on('data', (c) => (b += c));
+                    r2.on('end', () => resolve({ status: r2.statusCode, text: b }));
+                });
+                req.on('error', reject);
+                req.write(bodyStr);
+                req.end();
+            });
+        };
+
+        try {
+            // ⚠️ 格式坑(实测): /api/crons/run 要【裸数组】 [659]；
+            //    {"ids":[659]} 会被判 "value must be an array" 而 400。
+            //    注意与 /api/crons/disable|enable 不同 —— 那两个才收 {"ids":[...]}。
+            const r = await doPut(base + '/api/crons/run', JSON.stringify([id]));
+            let obj = {};
+            try { obj = JSON.parse(r.text || '{}'); } catch (e) { /* 非 JSON 也算到达 */ }
+            const ok = r.status === 200 && obj.code !== 401;
+            this._log('触发青龙任务 %d -> HTTP %d %s', id, r.status, (obj.msg || obj.message || '').toString().slice(0, 80));
+            return { ok, status: r.status, msg: obj.msg || obj.message || '' };
+        } catch (e) {
+            this._log('触发青龙任务 %d 失败: %s', id, (e && e.message) || e);
+            return { ok: false, error: String((e && e.message) || e) };
+        }
+    }
+
+    /** 私聊命令: 过码 / 签到 —— 立即触发一次签到任务(验证码会再推到 QQ) */
+    async _handleCommand(context, msg, sender) {
+        const t = msg.replace(/^[#！!\/]/, '').trim();
+        const cmd = t.toLowerCase();
+        // 允许: 过码 / 过验证码 / gostc / easyfrp / 签到 / 补签
+        const isSign = /^(过码|过验证码|补签|签到|签到一下)$/.test(t) ||
+            /^(gostc|easyfrp)(\s*签到)?$/.test(cmd);
+        if (!isSign) return false;
+
+        const taskId = process.env.EF_SIGN_TASK_ID || '659';
+        if (typeof context.reply === 'function') {
+            await context.reply('⏳ 正在触发 EasyFrp 签到，稍后会推一张验证码图片给你，请回复 4 位数字。');
+        }
+        const r = await this._runCrontask(taskId);
+        if (r.ok) {
+            this._log('管理员 %s 主动触发签到任务 %s', sender, taskId);
+            if (typeof context.reply === 'function') {
+                await context.reply(`✅ 已触发签到任务（#${taskId}）。验证码图片马上到，记得回复 4 位数字。`);
+            }
+        } else {
+            if (typeof context.reply === 'function') {
+                await context.reply(`❌ 触发失败：${r.error || r.msg || ('HTTP ' + r.status)}`);
+            }
+        }
+        return false; // 已处理, 但不阻断其它插件
+    }
+
     async onMessage(context) {
         const msg = String((context && context.msg) || '').trim();
         if (!msg) return false;
@@ -290,7 +402,14 @@ class QlNotifyPlugin extends BasePlugin {
         if (context && context.groupId) return false;
 
         const sender = String((context && context.userId) || '').trim();
-        // 4 位数字才是验证码回复；其它文本一律不拦截，行为与旧版完全一致
+
+        // 0) 优先处理命令（过码/签到）—— 必须在"4位数字"判定之前,
+        //    否则命令里带的数字会被误当成验证码答案
+        if (this.superAdmin && sender === String(this.superAdmin)) {
+            if (await this._handleCommand(context, msg, sender)) return false;
+        }
+
+        // 1) 4 位数字 = 验证码回复
         const m = msg.match(/^\s*(\d{4})\s*$/);
         if (!m) return false;
 
