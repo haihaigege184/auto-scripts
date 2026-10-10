@@ -26,6 +26,8 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   EF_TOKEN_FILE—— JWT 缓存路径, 默认 /ql/data/ef_token.txt (登录一次可用 7 天)
   EF_MAX_TRY   —— 验证码最大重试轮数, 默认 25
   EF_CAPTCHA_MODE —— 验证码来源: auto(默认, 先OCR后转人工) | manual(直接人工) | ocr(只用OCR)
+  EF_OCR_URL   —— 宿主机 OCR 服务地址(方案B, ddddocr), 如 http://172.17.0.1:13003/ocr
+                  不设则只用本地 cv2 模块(准确率低, 建议配这个)
   EF_OCR_TRY   —— auto 模式下先试 OCR 的轮数, 默认 2
   EF_HUMAN_TRY —— 人工过码最多尝试轮数, 默认 3
   EF_CAPTCHA_WAIT  —— 人工过码最长等待秒数, 默认 300
@@ -216,14 +218,42 @@ def fetch_captcha():
 
 
 def ocr_captcha(bs64, verbose=True):
-    """纯 OCR 识别。返回 (value, info)。识别不可靠时 value=None。"""
+    """OCR 识别。优先走宿主机 ddddocr 服务(方案B), 失败再退回本地 cv2 模块。
+
+    宿主机服务: ef_ocr_service.py (Debian, onnxruntime 有 wheel)
+      青龙容器是 Alpine musl, onnxruntime 装不上, 所以重活放宿主机, 容器只发 HTTP。
+      EF_OCR_URL=http://172.17.0.1:13003/ocr
+    """
+    # --- 1) 宿主机 ddddocr 服务 ---
+    host_ocr = os.environ.get("EF_OCR_URL", "").strip()
+    if host_ocr:
+        try:
+            body = json.dumps({"imageBase64": bs64}).encode("utf-8")
+            req = urllib.request.Request(
+                host_ocr, data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                resp = json.loads(r.read().decode())
+            if verbose:
+                log(f"  [ocr] 宿主机 ddddocr -> {resp.get('text')} "
+                    f"conf={resp.get('conf')} {resp.get('ms')}ms")
+            if resp.get("ok") and resp.get("text"):
+                return resp["text"], {"mode": "host_ocr", "text": resp["text"],
+                                      "conf": resp.get("conf", 1.0)}
+            if verbose:
+                log(f"  [ocr] 宿主机服务返回异常: {resp}")
+        except Exception as e:
+            if verbose:
+                log(f"  [ocr] 宿主机服务不可用({type(e).__name__}), 尝试本地模块")
+
+    # --- 2) 本地 cv2 模块 ---
     if ocr is None:
         return None, {"mode": "no_ocr"}
     try:
         tpl = ocr.load_templates()
         r = ocr.ocr_bs64(bs64, templates=tpl)
         if verbose:
-            log(f"  [captcha] OCR={r['text'] or '----'} score={r['score']} "
+            log(f"  [captcha] 本地OCR={r['text'] or '----'} score={r['score']} "
                 f"margin={r['min_margin']} ok={r['ok']} {r['debug']}")
         # score 过低说明连候选都不可靠, 换图; 仅仅 margin 小则照提交让服务端判
         if r["score"] < MIN_SUBMIT_SCORE:
