@@ -52,8 +52,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import ef_captcha_ocr as ocr
-except Exception:      # cv2 缺失时不阻塞登录/签到主体逻辑
+    OCR_IMPORT_ERR = ""
+except Exception as _e:   # cv2 缺失时不阻塞登录/签到主体逻辑
     ocr = None
+    # 记录原因: 静默 except 会让"OCR 其实坏了"变成看不见的降级
+    OCR_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
 
 DEFAULT_BASE = "https://easyfrp.sian.one"
 API_PREFIX = "/api"          # 前端 axios baseURL 就是 /api, 漏掉会拿到 SPA 的 index.html
@@ -558,7 +561,8 @@ def main():
     log(f"ℹ️ 验证码模式: {captcha_mode()}"
         + (" (仅人工过码)" if captcha_mode() != "ocr" else ""))
     if ocr is None:
-        log("⚠️ 未导入 cv2/OCR 模块, 将直接走人工过码通道")
+        log("⚠️ 本地 OCR 模块不可用, 将直接走人工过码通道"
+            + (f" ({OCR_IMPORT_ERR})" if OCR_IMPORT_ERR else ""))
 
     # 1) 登录
     token, err = ensure_token(account, password)
