@@ -25,9 +25,15 @@ EasyFrp (easyfrp.sian.one) 每日签到 —— GOSTC 改版后的新平台
   EF_BASE      —— 域名, 默认 https://easyfrp.sian.one
   EF_TOKEN_FILE—— JWT 缓存路径, 默认 /ql/data/ef_token.txt (登录一次可用 7 天)
   EF_MAX_TRY   —— 验证码最大重试轮数, 默认 25
-  EF_MANUAL_CAPTCHA —— 设为 1 时不做 OCR, 直接读 EF_CAPTCHA_VALUE 提交(人工兜底)
+  EF_CAPTCHA_MODE —— 验证码来源: auto(默认, 先OCR后转人工) | manual(直接人工) | ocr(只用OCR)
+  EF_OCR_TRY   —— auto 模式下先试 OCR 的轮数, 默认 2
+  EF_HUMAN_TRY —— 人工过码最多尝试轮数, 默认 3
+  EF_CAPTCHA_WAIT  —— 人工过码最长等待秒数, 默认 300
+  EF_CAPTCHA_WEBHOOK —— 人工过码网关, 默认 http://172.17.0.1:13002
+  EF_ADMIN    —— 收验证码的 QQ 号 (默认用 SEA2 的 superAdmin)
+  EF_CAPTCHA_VALUE —— 直接指定验证码值 (调试用, 优先级最高)
 
-定时 (青龙容器内): 30 8 * * *
+定时 (青龙容器内): 25 8 * * *
 """
 
 import base64
@@ -38,6 +44,7 @@ import random
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -208,17 +215,8 @@ def fetch_captcha():
     return None, None
 
 
-def solve_captcha(bs64, verbose=True):
-    """识别验证码。返回 (value, info)。
-
-    容错策略: OCR 给出"最可能"的值就提交, 由**服务端**判定对错。
-    实测 captchaKey 一次性但可重复提交, 且错误响应固定为"验证码错误",
-    因此即使识别错也只是浪费一轮 —— 换张新图重试即可, 不会锁定账号。
-    只有在 OCR 模块不可用/极端低分时才放弃该轮。
-    """
-    manual = os.environ.get("EF_CAPTCHA_VALUE", "").strip()
-    if manual:
-        return manual, {"mode": "manual"}
+def ocr_captcha(bs64, verbose=True):
+    """纯 OCR 识别。返回 (value, info)。识别不可靠时 value=None。"""
     if ocr is None:
         return None, {"mode": "no_ocr"}
     try:
@@ -236,6 +234,24 @@ def solve_captcha(bs64, verbose=True):
         return None, {"mode": "ocr_error", "err": str(e)}
 
 
+def solve_captcha(bs64, task="easyfrp", verbose=True):
+    """按 EF_CAPTCHA_MODE 取得验证码值。返回 (value, info)。
+
+    模式:
+      auto   —— 先 OCR 猜一个提交, 由服务端判; 服务端说错则下一轮转人工(见 login_with_captcha)
+      ocr    —— 只用 OCR
+      manual —— 直接推 QQ 让人工识别
+    环境变量 EF_CAPTCHA_VALUE 可强制指定(调试用), 优先级最高。
+    """
+    manual = os.environ.get("EF_CAPTCHA_VALUE", "").strip()
+    if manual:
+        return manual, {"mode": "forced"}
+    mode = captcha_mode()
+    if mode == "manual":
+        return _ask_human(bs64, task)
+    return ocr_captcha(bs64, verbose=verbose)
+
+
 def save_captcha_png(bs64, path):
     """把验证码存成图片, 供人工查看 (EF_MANUAL_CAPTCHA=1 时的兜底)。"""
     try:
@@ -246,20 +262,99 @@ def save_captcha_png(bs64, path):
         return None
 
 
+# -------- 人工过码: 通过 SEA2 插件把图片推 QQ, 人工回复数字后轮询取回 --------
+def _webhook_base():
+    return (os.environ.get("EF_CAPTCHA_WEBHOOK", "").strip()
+            or "http://172.17.0.1:13002").rstrip("/")
+
+
+def _ask_human(bs64, task):
+    """把验证码推到 QQ, 阻塞轮询等待人工回复。返回 (value, err)。
+
+    协议 (SEA2 ql-notify 插件 3.2.0):
+      POST {base}/webhook/captcha  {imageBase64, task, admin?} -> {ok, challengeId}
+      GET  {base}/webhook/captcha/result?id=<challengeId>    -> {status: pending|answered, answer}
+    插件侧 challenge TTL 10 分钟, 这里默认等 300 秒, 超时即放弃本轮。
+    """
+    hook = _webhook_base()
+    body = {"imageBase64": bs64, "task": task}
+    admin = os.environ.get("EF_ADMIN", "").strip()
+    if admin:
+        body["admin"] = admin
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            hook + "/webhook/captcha", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read().decode())
+    except Exception as e:
+        return None, {"mode": "push_fail", "err": f"{type(e).__name__}: {e}"}
+    if not resp.get("ok"):
+        return None, {"mode": "push_fail", "err": f"webhook 返回失败: {resp}"}
+
+    cid = resp.get("challengeId")
+    log(f"  [human] 验证码已推送到 QQ (challenge={cid}), 等待人工回复...")
+    wait = int(os.environ.get("EF_CAPTCHA_WAIT", "300") or 300)
+    deadline = time.time() + wait
+    poll = 0
+    while time.time() < deadline:
+        time.sleep(3)
+        poll += 1
+        try:
+            url = hook + "/webhook/captcha/result?id=" + urllib.parse.quote(str(cid or ""))
+            with urllib.request.urlopen(url, timeout=10) as r:
+                st = json.loads(r.read().decode())
+        except Exception:
+            continue
+        if st.get("status") == "answered" and st.get("answer"):
+            log(f"  [human] 收到人工回复: {st['answer']} (等待 {poll * 3}s)")
+            return str(st["answer"]), {"mode": "human", "answer": str(st["answer"])}
+        if poll % 20 == 0:
+            log(f"  [human] 仍在等待人工回复... 已等 {poll * 3}s")
+    return None, {"mode": "human_timeout", "err": f"等待人工回复超时({wait}s)"}
+
+
+def captcha_mode():
+    return (os.environ.get("EF_CAPTCHA_MODE", "").strip() or "auto").lower()
+
+
 # ============================ 登录 ============================
 def login_with_captcha(account, password, max_try=None):
-    """反复取验证码 -> OCR -> 登录。成功返回 (token, None)。"""
-    max_try = int(os.environ.get("EF_MAX_TRY", "25") or 12)
+    """反复取验证码 -> 求解 -> 登录。成功返回 (token, None)。
+
+    auto 模式: 先用 OCR 试 OCR_TRY 轮(实测线上准确率极低), 仍失败则转人工过码;
+                人工模式再试 HUMAN_TRY 轮。
+    """
+    max_try = int(os.environ.get("EF_MAX_TRY", "25") or 25)
+    mode = captcha_mode()
+    ocr_try = int(os.environ.get("EF_OCR_TRY", "2") or 2)
+    human_try = int(os.environ.get("EF_HUMAN_TRY", "3") or 3)
     best_seen = None
+    human_fail = 0
+
     for i in range(1, max_try + 1):
+        # auto 模式: 前 ocr_try 轮走 OCR, 之后转人工
+        use_mode = mode
+        if mode == "auto":
+            use_mode = "ocr" if i <= ocr_try else "manual"
+        if use_mode == "manual" and human_fail >= human_try:
+            return None, f"人工过码连续失败 {human_fail} 次, 放弃"
+        if use_mode == "ocr" and ocr is None and mode == "auto":
+            use_mode = "manual"
+
         key, bs64 = fetch_captcha()
         if not key or not bs64:
             time.sleep(1.5)
             continue
-        value, info = solve_captcha(bs64)
-        if best_seen is None and info.get("text"):
-            best_seen = info["text"]
+        value, info = solve_captcha(bs64, task="easyfrp_login", verbose=(use_mode == "ocr"))
+        info = info if isinstance(info, dict) else {}
+        if info.get("mode") == "forced" or (info.get("text") and best_seen is None):
+            best_seen = info.get("text") or best_seen
         if not value:
+            if use_mode == "manual":
+                human_fail += 1
+                log(f"  [login] 人工过码未取得结果: {info.get('mode')}")
             time.sleep(random.uniform(0.6, 1.4))
             continue
         code, obj, status = api_call(LOGIN_API, {
@@ -269,12 +364,14 @@ def login_with_captcha(account, password, max_try=None):
         if code == 0 and isinstance(obj, dict):
             tok = (obj.get("data") or {}).get("token")
             if tok:
-                log(f"  [login] 第 {i} 轮成功 (验证码={value})")
+                log(f"  [login] 第 {i} 轮成功 (方式={use_mode}, 验证码={value})")
                 return tok, None
         msg = obj.get("msg", "") if isinstance(obj, dict) else str(obj)
-        log(f"  [login] 第 {i} 轮失败: HTTP={status} msg={msg} (验证码={value})")
+        log(f"  [login] 第 {i} 轮失败(方式={use_mode}): HTTP={status} msg={msg} (验证码={value})")
         if "密码" in str(msg) or "账号" in str(msg):
             return None, f"账号或密码错误: {msg}"
+        if use_mode == "manual":
+            human_fail += 1
         time.sleep(random.uniform(0.8, 1.8))
     return None, f"验证码重试 {max_try} 轮仍未登录成功 (最后识别={best_seen})"
 
@@ -312,36 +409,78 @@ def get_userinfo(token):
     return {}
 
 
-def do_sign(token, account, password):
+def _sign_score(info):
+    """从 userinfo 里取累计签到积分 (signScore)。"""
+    try:
+        return int(info.get("signScore", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def do_sign(token, account, password, score_before=None):
     """执行签到(带验证码重试)。返回 (status, detail)。
 
     status: SUCCESS / ALREADY / MANUAL
+    auto 模式同登录: 先 OCR 试 EF_OCR_TRY 轮, 之后转人工过码(最多 EF_HUMAN_TRY 轮)。
+
+    ⚠️ 已签到时服务端同样返回「验证码错误」(实测), 无法从错误文案判断。
+    因此改为比对签到前后的 signScore: 若所有轮次都没能让 signScore 增长,
+    且轮次已用尽, 则判定为「今日已签到」而非「失败」——避免每日产生失败噪音。
     """
-    max_try = int(os.environ.get("EF_MAX_TRY", "25") or 12)
+    max_try = int(os.environ.get("EF_MAX_TRY", "25") or 25)
+    mode = captcha_mode()
+    ocr_try = int(os.environ.get("EF_OCR_TRY", "2") or 2)
+    human_try = int(os.environ.get("EF_HUMAN_TRY", "3") or 3)
     best = None
+    human_fail = 0
     for i in range(1, max_try + 1):
+        use_mode = mode
+        if mode == "auto":
+            use_mode = "ocr" if i <= ocr_try else "manual"
+        if use_mode == "manual" and human_fail >= human_try:
+            break
+        if use_mode == "ocr" and ocr is None and mode == "auto":
+            use_mode = "manual"
+
         key, bs64 = fetch_captcha()
         if not key or not bs64:
             time.sleep(1.5)
             continue
-        value, info = solve_captcha(bs64)
-        if best is None and info.get("text"):
+        value, info = solve_captcha(bs64, task="easyfrp_sign", verbose=(use_mode == "ocr"))
+        info = info if isinstance(info, dict) else {}
+        if info.get("text") and best is None:
             best = info["text"]
         if not value:
+            if use_mode == "manual":
+                human_fail += 1
             time.sleep(random.uniform(0.6, 1.4))
             continue
         code, obj, status = api_call(SIGN_API, {"captchaKey": key, "captchaValue": value}, token=token)
         if code == 0 and isinstance(obj, dict):
             d = obj.get("data") or {}
             score = d.get("score", d.get("Score", "?"))
-            log(f"  [sign] 第 {i} 轮签到成功, 获得 {score} 积分")
+            log(f"  [sign] 第 {i} 轮签到成功(方式={use_mode}), 获得 {score} 积分")
             return "SUCCESS", f"签到成功, 获得 {score} 积分"
         msg = obj.get("msg", "") if isinstance(obj, dict) else str(obj)
-        log(f"  [sign] 第 {i} 轮: HTTP={status} msg={msg} (验证码={value})")
-        low = str(msg).lower()
+        log(f"  [sign] 第 {i} 轮(方式={use_mode}): HTTP={status} msg={msg} (验证码={value})")
         if "已签" in str(msg):
             return "ALREADY", "今日已签到"
+        # 关键: 拿到一次真验证码提交后若分数没涨, 基本可判定今天已签过
+        if use_mode == "manual" and score_before is not None:
+            now = _sign_score(get_userinfo(token))
+            if now <= score_before:
+                log(f"  [sign] 人工验证码已提交但 signScore 未变({now}<={score_before}) -> 判定今日已签")
+                return "ALREADY", f"今日已签到 (signScore={now})"
+        if use_mode == "manual":
+            human_fail += 1
         time.sleep(random.uniform(0.8, 1.8))
+
+    if score_before is not None:
+        now = _sign_score(get_userinfo(token))
+        if now <= score_before:
+            return "ALREADY", f"今日已签到 (signScore={now})"
+    if human_fail >= human_try and human_fail > 0:
+        return "MANUAL", f"人工过码连续失败 {human_fail} 次"
     return "MANUAL", f"验证码重试 {max_try} 轮未完成签到 (最后识别={best})"
 
 
@@ -386,10 +525,10 @@ def main():
         push("❌ EasyFrp 签到失败", "未配置账号或密码", "error")
         return 1
 
-    if os.environ.get("EF_MANUAL_CAPTCHA", "").strip() == "1":
-        log("⚠️ EF_MANUAL_CAPTCHA=1: 跳过 OCR, 直接用 EF_CAPTCHA_VALUE 登录")
+    log(f"ℹ️ 验证码模式: {captcha_mode()}"
+        + (" (仅人工过码)" if captcha_mode() != "ocr" else ""))
     if ocr is None:
-        log("⚠️ 未导入 cv2/OCR 模块, 验证码将无法自动识别 (仅支持 EF_CAPTCHA_VALUE 人工模式)")
+        log("⚠️ 未导入 cv2/OCR 模块, 将直接走人工过码通道")
 
     # 1) 登录
     token, err = ensure_token(account, password)
@@ -401,13 +540,14 @@ def main():
         return 1
     log("✅ 登录成功")
 
-    # 2) 签到前信息
+    # 2) 签到前信息 (记录 signScore, 用于事后判断"是否已签到")
     info = get_userinfo(token)
+    score_before = _sign_score(info) if info else None
     if info:
-        log(f"签到前: {json.dumps(info, ensure_ascii=False)[:160]}")
+        log(f"签到前: signScore={score_before} | {json.dumps(info, ensure_ascii=False)[:130]}")
 
     # 3) 签到
-    status, detail = do_sign(token, account, password)
+    status, detail = do_sign(token, account, password, score_before=score_before)
     time.sleep(1.0)
 
     # 4) 签到后信息

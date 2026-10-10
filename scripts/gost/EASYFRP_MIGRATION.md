@@ -1,63 +1,88 @@
-# EasyFrp 签到迁移 —— 调研结论与工程状态
+# EasyFrp 签到迁移 —— 工程状态与结论
 
-## 结论速览
+## ✅ 最终状态：**已跑通**（2026-10-10 19:02 端到端验证）
+
+| 环节 | 结果 |
+|---|---|
+| 登录（新平台） | ✅ 人工过码 `1966` → 登录成功，token 已缓存 |
+| 每日签到 | ✅ 人工过码 `4352` → 签到成功，+5 积分（signScore 0→5） |
+| token 缓存 | ✅ 384 字符，`/ql/data/ef_token.txt`，**7 天有效** |
+| 缓存命中 | ✅ 后续运行跳过登录验证码，每日只需过一次码（签到） |
+| 已签到识别 | ✅ 靠 signScore 变化判断，返回「今日已签到」不误报 |
+| 青龙任务 | ✅ `659 EasyFrp签到-新平台`，每日 `25 8* * *` 已启用 |
+
+## 人工过码闭环（QQ 收发）—— 已上线
+
+用户只需在 QQ 私聊里**直接回复 4 位数字**，全程无需守在电脑前。
+
+### 实现（SEA2 `ql-notify` 插件 3.2.0）
+
+```
+青龙脚本                SEA2 插件 (13002)              QQ
+  │ POST /webhook/captcha        │                        │
+  │ {imageBase64, task} ───────> │ adapter.send(admin,    │
+  │                              │ b64, {type:'image'}) ─>│ 图片送达
+  │<─ {challengeId} ─────────────│                        │
+  │                              │   用户回复 4 位数字 ───>│
+  │                              │<─ onMessage 匹配       │
+  │ GET /webhook/captcha/result  │                        │
+  │─────────────────────────────> │ (轮询取答案)           │
+```
+
+- **协议**：`POST /webhook/captcha` → `{ok, challengeId}`；`GET /webhook/captcha/result?id=` → `{status, answer}`
+- **安全**：仅私聊 + 仅 challenge 指定管理员（superAdmin）+ 4位数字正则 + 随机 id + 10 分钟 TTL
+- **诊断**：`GET /webhook/captcha/pending` 查看未过期 challenge 概况
+- 关键 API：`adapter.send(uin, base64, {type:'image'})` 发图片；`onMessage` 里 `context.userId` / `context.groupId` / `context.reply`
+- SEA2 由 pm2 管理，改插件后 `pm2 restart sea2-bot`；重启后需等 NapCat 重新连入（约 1-2 分钟）才能发图
+
+### 验证码模式（`EF_CAPTCHA_MODE`）
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 先 OCR 试 `EF_OCR_TRY` 轮（默认 2），失败转人工（最多 `EF_HUMAN_TRY` 轮，默认 3） |
+| `manual` | 直接人工过码 |
+| `ocr` | 只用 OCR |
+
+其他参数：`EF_CAPTCHA_WAIT`（等待秒数，默认 300）、`EF_HUMAN_TRY`、`EF_OCR_TRY`、`EF_ADMIN`、`EF_CAPTCHA_WEBHOOK`（默认 `http://172.17.0.1:13002`）
+
+## 接口对照
 
 | 项 | 老平台 GOSTC | 新平台 EasyFrp |
 |---|---|---|
 | 域名 | `gost.sian.one` | `easyfrp.sian.one` |
-| API 前缀 | 无 | `/api` |
+| API 前缀 | 无 | **`/api`** |
 | 登录 | `POST /v1/auth/login` | `POST /v1/auth/login` + **图形验证码** |
 | 用户信息 | `POST /v1/auth/userInfo` | `POST /v1/auth/userinfo` |
 | 签到 | `POST /v1/auth/checkin` | `POST /v1/auth/sign` **body 需 captchaKey/captchaValue** |
-| 签到日历/积分 | — | `POST /v1/normal/system/user/sign/summary` |
+| 签到日历 | — | `POST /v1/normal/system/user/sign/summary`（实测返回 EOF，暂不可用） |
 | 鉴权头 | `Token: <jwt>` | `Token: <jwt>`（一致） |
 | 返回码 | `code: 0` 成功 | `code: 0` 成功 / `1` 业务错（如"验证码错误"） |
-
-**接口结构与老平台几乎同构，迁移的阻碍只有一处：登录和签到都需要图形验证码（4 位数字 + 彩色干扰线）。**
 
 ## 验证码实测特性
 
 - 图片：`POST /api/v1/auth/captcha` → `data.key` + `data.bs64`（120x40 JPEG，4 位纯数字）
-- `captchaKey` **一次性且可重复提交**（实测同一 key 连续试 4 个值都返回"验证码错误"，key 未失效）
+- `captchaKey` **一次性且可重复提交**（同一 key 连续试 4 个值都返回"验证码错误"，key 未失效）
 - 登录校验顺序：**先验验证码，再验密码**（错误密码也返回"验证码错误"）
-- 干扰线：多条 1-3px 彩色细线，部分较粗；字符为低饱和深色（图像 S 中位数仅 ~11）
+- ⚠️ **签到接口无法区分"验证码错"和"今日已签"** —— 两者都返回"验证码错误"，
+  所以脚本改为比对签到前后的 `signScore` 来判定是否已签（实测可靠）
+- 干扰线：多条粗彩线直接压在字符上，密度很高
 
-## 已完成的工程产物
+## OCR 模块（保留为备用自动化手段）
 
 | 文件 | 作用 |
 |---|---|
 | `ef_captcha_ocr.py` | 纯 cv2 验证码 OCR（暗度分割 + DP 切分 + 模板匹配），零 ML 依赖 |
-| `build_ef_templates.py` | 模板库训练脚本（52 张人工标注样本 → `templates_ef.npz`） |
-| `templates_ef.npz` | 128 个字模，10 类数字全覆盖 |
-| `ef_samples/` | 52 张标注样本 |
+| `build_ef_templates.py` | 模板库训练脚本（72 张人工标注样本 → `templates_ef.npz`） |
+| `templates_ef.npz` | 字模模板库 |
+| `ef_samples/` | 72 张标注样本（后续 ML 方案可直接复用） |
 
-## OCR 效果实测（关键数据 —— 这是本次调研最重要的产出）
-
-| 数据集 | 数量 | 准确率 |
-|---|---|---|
-| 训练集自测 | 60 张 | 100% |
-| 全新样本（中等难度） | 20 张 | 55% |
-| **线上真实难度（密集干扰线）** | **12 张** | **0%** |
-| 端到端实跑 | 25 轮 | 0 次通过 |
-
-### 结论：纯模板匹配 OCR 路线在真实难度下不可行
-
-**根因分析（已定位，非猜测）**：
-线上验证码的干扰线密度远高于前期抓取的样本 —— 几乎每张都有 10+ 条粗彩线直接压在字符上，
-字符被切割成更碎的小块，间距也不均匀。这导致：
-1. 掩膜阶段：粗线与笔画宽度接近，`WIDTH_MIN` 过滤不掉
-2. DP 切分阶段：字符间空白消失，切点只能落在笔画中间 → 字模残缺
-3. 模板匹配阶段：字模形态与模板差异过大 → NCC 分数普遍 0.6 左右且 top1/top2 分数接近
-
-前期"训练集 100%"是**严重过拟合的假象** —— 模板库只覆盖了已见过的字体/难度组合。
+**实测准确率**：训练集 100% / **线上真实难度 0%** —— 干扰线与字符在像素层面交织，
+传统 CV 路线天花板低。详见下方「走过的弯路」。
 
 ### 保留价值
 
-- `ef_captcha_ocr.py` 的**掩膜提取 + DP 切分骨架是可用的**（切分整齐率 20/20），
-  差的是"从残缺字模恢复字符"这一步 —— 这正是需要 ML 模型（CNN/CRNN）的地方。
-- `templates_ef.npz` + **72 张人工标注样本**（`ef_samples/`）是已标注数据集，
-  若后续改用 ML 方案可直接复用，不必重新标注。
-  （已放宽 .gitignore 的 `*.jpg` 规则让样本入库 —— 否则数据集会被当调试产物忽略掉。）
+掩膜提取 + DP 切分骨架是可用的（切分整齐率 20/20），差的是"从残缺字模恢复字符"
+—— 这正是 ML（CNN/CRNN）的用武之地。72 张标注样本已入库，可直接作训练集。
 
 ### 走过的弯路（避免重复踩坑）
 
@@ -69,44 +94,24 @@
 | 结构特征加权（NCC+密度+连通域） | 0/20 | 手工权重把纯 NCC 信号拉偏，不如纯形状匹配 |
 | 形态学细线抑制 | 字符被一起抹掉 | "实心块判定"失效；细线穿过字符时与字符同连通域 |
 | 服务端 oracle 换图重试 | 25 轮 0 通过 | 前提是单次准确率够高，0% 时重试无意义 |
+| ddddocr | 容器内不可用 | 依赖 `onnxruntime`，Alpine musl 无 wheel |
 
 **根本教训**：这类验证码的干扰线与字符**在像素层面交织**，传统 CV 路线（分割→分类）
-天花板很低。必须要么用**能整体看图**的模型（CNN/CRNN），要么用**人工**。
+天花板低。要么用**能整体看图的模型**，要么用**人工**（当前方案）。
 
-## 建议方案（按投入产出排序）
+## 部署要点（踩过的坑）
 
-### 方案 A（推荐，当天可上线）：人工过码 + token 缓存
+- 容器是 Alpine musl：`onnxruntime` / `opencv-python-headless` 都无 wheel
+- `/usr/bin/python3`（py3.12）pip 坏了（pyexpat 符号冲突）；**`/usr/local/bin/python3`（py3.11）才可用**；cv2 只在 py3.12 那个里
+- 传文件到容器：`docker cp` 不认 Windows 路径 → **SFTP 传到宿主机 `/tmp`**（纯 ASCII 文件名）→ `docker cp` 进容器
+- 中文文件名 + `echo base64 >` 会写失败；SFTP 最稳
+- 大 payload（>~500KB）会断连，别用 base64 分块
+- 青龙 `/api/crons/disable|enable` 的 body 必须是**数字数组** `{"ids":[659]}`，字符串数组 400
 
-登录时把验证码图片推送到微信，人工输入一次 → token 缓存到 `/ql/data/ef_token.txt`。
-**JWT 有效期 7 天**，所以平均每周只需人工介入 1~2 次，其余每日签到全自动完成。
+## 后续可选
 
-- 改造量：已在 `EasyFrp签到.py` 预留 `EF_CAPTCHA_VALUE` / `EF_MANUAL_CAPTCHA` 两个开关
-- 可靠性：接近 100%
-- 局限：并非"零人工"，但人工成本被 7 天有效期摊薄到极低
-
-### 方案 B：引入 ML 识别模型（真正全自动）
-
-- 现成方案：`ddddocr`（专为验证码设计，纯数字识别准确率 90%+）
-- ⚠️ **容器内已实测受阻**：`ddddocr` 依赖 `onnxruntime`，而 Alpine musl 无对应 wheel
-  （`pip install onnxruntime` → "No matching distribution found"）。
-  `ddddocr` 本体用 `--no-deps` 装上了，但缺推理后端无法工作。
-  这与 1ms 项目 cv2 遇到的是同一类问题（Alpine musl 缺二进制 wheel）。
-- 可行替代：
-  1. **在宿主机/本机跑 OCR**，容器只负责 HTTP 调用（跨机调用，参考 1ms 的 `crackTCaptcha` 思路）
-  2. 换 **Debian 版青龙**或给容器装 `gcompat`/`libstdc++` 兼容层后再试 onnxruntime
-  3. 用 **PyTorch (CPU)** 训一个小型 CRNN —— `ef_samples/` 的 72 张标注样本已就位，
-     但样本量偏少，建议先扩到 300+ 张
-- 预期工作量：方案 1 约 2~3 小时
-
-### 方案 C：老平台保底（已就绪且运行中）
-
-- 青龙任务 `644 GOSTC签到.py` 保持启用，`20 7* * *`，老平台 10-09 仍签到成功（余额 443→451）
-- 新平台任务 `658 EasyFrp签到-新平台` 已建好但**已禁用**，避免每日失败噪音
-- 待验证码方案落地后再启用 658
-
-## 待确认事项
-
-- EasyFrp 账号 `dad2056` 的密码是否与老平台一致（登录被验证码挡住，**始终未验证**）。
-  ⚠️ 这是最大未知项 —— 若密码不同，方案 A/B 都会失败。
-- 新平台签到"积分"与老平台"余额/流量"的对应关系（签到成功后查 summary 接口确认）。
-- 验证码难度是否随机浮动（同一时段内是否有简单窗口）。
+- `EF_CAPTCHA_MODE` 默认 `auto`，每天仍会先试 2 轮 OCR（浪费约 5 秒）。
+  若确认 OCR 无用，可设 `manual` 省掉。
+- 彻底无人值守需走 ML：72 张标注已在 `ef_samples/`，建议扩到 300+ 训 CRNN；
+  **注意 onnxruntime 在容器内装不上，需在宿主机跑**。
+- 老平台任务 `644 GOSTC签到.py` 保持启用作为保底，等新平台稳定几天后再停。
